@@ -1,0 +1,22 @@
+﻿ArcadeClip 0.3.0 - AMD64 / ARM64
+
+Windows 10/11 AMD64 및 Windows 11 ARM64용 통합 설치 파일입니다.
+Windows의 실제 아키텍처에 맞는 앱을 자동으로 설치합니다.
+관리자 권한이 필요하지 않습니다.
+
+설치 중 Python과 FFmpeg를 각각 선택할 수 있습니다.
+- PATH에서 호환되는 설치를 발견하면 로컬 사용을 권장합니다.
+- Python은 앱 아키텍처와 일치하는 CPython 3.13이 필요합니다.
+- 앱 패키지는 항상 앱 전용 폴더에 제공하며 전역 Python을 변경하지 않습니다.
+- OCR 보조 Python은 x64 격리 환경으로 항상 내장합니다.
+- FFmpeg 선택은 명령줄 도구에 적용됩니다. Qt/PyAV 미디어 라이브러리는 항상 포함합니다.
+- 로컬 런타임을 제거했다면 설치 파일을 다시 실행해 내장 옵션으로 바꿀 수 있습니다.
+
+기본 설치 위치: LocalAppData\Programs\ArcadeClip
+기존 ARM64 설치본은 같은 위치에 업데이트할 수 있습니다.
+사용자 데이터 폴더의 영상·프로필·작업 파일은 설치나 제거 시 삭제하지 않습니다.
+곡 자켓 데이터와 OCR 모델은 처음 사용할 때 다운로드합니다.
+이 버전에는 미리보기·인식·GPU 분석 개선 및 OBS/YouTube 스트림 수신 기능이 포함됩니다.
+
+This is a modified community build of ArcadeClip.
+See DISTRIBUTION.md, LICENSE, COPYING.GPLv3 and licenses for component notices.

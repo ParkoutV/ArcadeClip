@@ -1,0 +1,24 @@
+{
+  "python-arm64": {
+    "url": "https://www.python.org/ftp/python/3.13.12/python-3.13.12-embeddable-arm64.zip",
+    "sha256": "552e0653c6dd3c8e6b4e735a0d8550bef50d86079033619f377b841d57276a18"
+  },
+  "python-amd64": {
+    "url": "https://www.python.org/ftp/python/3.13.12/python-3.13.12-embeddable-amd64.zip",
+    "sha256": "f0b5a8e2662f51cfedefaf7cc0b8c22f05b776efa4a392042946422662e3a23c"
+  },
+  "ffmpeg": {
+    "url": "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/ffmpeg-8.1.3/ffmpeg-8.1.3_arm64-windows-shared-gpl.zip",
+    "sha256": "6a70afaac4c3310c9932e603a79d3fd87ea33c2c2795c1723a623426c27767d2",
+    "source": "https://github.com/System233/ffmpeg-msvc-prebuilt/tree/ffmpeg-8.1.3",
+    "release": "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/tag/ffmpeg-8.1.3"
+  },
+  "deno": {
+    "url": "https://github.com/denoland/deno/releases/download/v2.9.6/deno-aarch64-pc-windows-msvc.zip",
+    "sha256": "acb014afe2299847764e232b4993e162e3946cdeec36603e3f1a0b548cd1ea55"
+  },
+  "zig": {
+    "url": "https://ziglang.org/download/0.15.2/zig-aarch64-windows-0.15.2.zip",
+    "sha256": "b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370"
+  }
+}

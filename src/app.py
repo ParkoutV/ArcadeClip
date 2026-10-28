@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         self.path = None
         self.remote = None
         self.source_info = {}
+        self.local_durations = {}
         self.task = None
         self.pending_close = False
         self.range_end = None
@@ -117,6 +118,35 @@ class MainWindow(QMainWindow):
         self.clip_undo = None
         build_window(self)
 
+    def _known_local_duration(self, path: Path) -> float:
+        if not path:
+            return 0.0
+        key = source_key(path)
+        cached = self.local_durations.get(key, 0.0)
+        if isinstance(cached, (int, float)) and cached > 0:
+            return float(cached)
+        meta_file = Path(path).parent / "source.json"
+        if meta_file.is_file():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                local_dur = meta.get("local_duration")
+                if isinstance(local_dur, (int, float)) and local_dur > 0:
+                    self.local_durations[key] = float(local_dur)
+                    return float(local_dur)
+            except (OSError, ValueError):
+                pass
+        return 0.0
+
+    def current_duration(self) -> float:
+        if not self.path:
+            return 0.0
+        player_ms = self.preview.player.duration()
+        if isinstance(player_ms, (int, float)) and player_ms > 0:
+            return player_ms / 1000
+        if getattr(self.preview, "fallback_duration", 0) > 0:
+            return self.preview.fallback_duration / 1000
+        return self._known_local_duration(self.path)
+
     def set_stage(self, index):
         if index == 1 and self.remote:
             index = 5
@@ -135,7 +165,7 @@ class MainWindow(QMainWindow):
                 try:
                     self.review_selection = (parse_time(self.start_time.text()), parse_time(self.end_time.text()))
                 except ValueError:
-                    self.review_selection = (0, self.preview.player.duration() / 1000)
+                    self.review_selection = (0, self.current_duration())
         self.stage = index
         self.source_next.setEnabled(bool(self.path or self.remote) and not self.task)
         self.source_next.setText(tr('YouTube 다운로드로 →') if self.remote else tr('시간 선택으로 →'))
@@ -191,7 +221,7 @@ class MainWindow(QMainWindow):
             start, end = self.review_selection if self.stage == 3 else (parse_time(self.start_time.text()), parse_time(self.end_time.text()))
         except ValueError:
             return
-        duration = self.preview.player.duration() / 1000 if self.path else (self.remote or {}).get("duration", 0)
+        duration = self.current_duration() if self.path else (self.remote or {}).get("duration", 0)
         position = self.preview.player.position() / 1000
         for timeline in (self.full_timeline, self.zoom_timeline):
             timeline.extent = duration or max(1, end)
@@ -252,7 +282,7 @@ class MainWindow(QMainWindow):
             self.analysis_metrics.setText(
                 tr(
                     '{value1} · 디코더 {decoder_threads}스레드 · 디코딩 {decode_s:.2f}s · 이미지 변환 {convert_s:.2f}s · 판독 누적 {match_s:.2f}s · 디코딩 {decoded_frames:,}장 / 샘플 {sample_frames:,}장',
-                    value1=metrics.get('decoder', 'CPU'),
+                    value1=metrics.get('decoder', 'CPU') + (' / ' + metrics['converter'] if metrics.get('converter') else ''),
                     decoder_threads=metrics['decoder_threads'],
                     decode_s=metrics['decode_s'],
                     convert_s=metrics['convert_s'],
@@ -281,7 +311,7 @@ class MainWindow(QMainWindow):
             self.clip_fields["end"].setText(format_time(end))
 
     def select_whole(self):
-        duration = self.preview.player.duration() / 1000 if self.path else (self.remote or {}).get("duration", 0)
+        duration = self.current_duration() if self.path else (self.remote or {}).get("duration", 0)
         self.start_time.setText(format_time(0))
         self.end_time.setText(format_time(duration or 0))
 
@@ -334,7 +364,7 @@ class MainWindow(QMainWindow):
                 row["manual_bounds"] = True
             row.update(edited=True, reviewed=self.clip_reviewed.isChecked())
             validate_clip(row)
-            if self.path == Path(row["source"]) and self.preview.player.duration() > 0 and row["end"] > self.preview.player.duration() / 1000 + .001:
+            if self.path == Path(row["source"]) and self.current_duration() > 0 and row["end"] > self.current_duration() + .001:
                 raise ValueError(tr('영상 길이 안에서 구간을 지정해 주세요.'))
             self.clip_undo = deepcopy(self.ranges)
             self.ranges[index] = row
@@ -467,7 +497,7 @@ class MainWindow(QMainWindow):
         from chapters import check_format, description, refused
         rows = self.chapter_rows()
         template, gap = self.chapter_style()
-        duration = self.preview.player.duration() / 1000 if self.path else 0
+        duration = self.current_duration() if self.path else 0
         problem = check_format(template)
         if problem:
             self.chapter_text.setPlainText("")
@@ -491,7 +521,7 @@ class MainWindow(QMainWindow):
     def export_chapter_video(self):
         from chapters import write_chapters
         rows = self.chapter_rows()
-        duration = self.preview.player.duration() / 1000 if self.path else 0
+        duration = self.current_duration() if self.path else 0
         if not rows or self.task:
             return
         if not duration:
@@ -593,9 +623,16 @@ class MainWindow(QMainWindow):
         self.pending_range = None
         self.review_selection = (0, 0)
         regions = self.preview.regions
+        known_duration = self._known_local_duration(self.path)
         self.start_time.setText(format_time(0))
-        self.end_time.setText(format_time(0))
+        self.end_time.setText(format_time(known_duration))
         self.preview.load(self.path)
+        if known_duration > 0 and getattr(self.preview, "fallback_duration", 0) <= 0:
+            self.preview.fallback_duration = round(known_duration * 1000)
+            if self.preview.player.duration() <= 0:
+                self.preview._duration_changed(self.preview.fallback_duration)
+        elif getattr(self.preview, "fallback_duration", 0) > 0 and self.end_time.text() == format_time(0):
+            self.end_time.setText(format_time(self.preview.fallback_duration / 1000))
         self.profile.restore_after_load(regions)
         self.refresh_ranges()
         self.source_picker.blockSignals(True)
@@ -609,8 +646,13 @@ class MainWindow(QMainWindow):
 
     def media_loaded(self, milliseconds):
         if self.path and milliseconds > 0:
+            self.local_durations[source_key(self.path)] = milliseconds / 1000
             if self.end_time.text() == format_time(0):
                 self.end_time.setText(format_time(milliseconds / 1000))
+            self.analysis_range_summary.setText(
+                tr('분석 구간: {start} – {end}', start=self.start_time.text(), end=self.end_time.text())
+            )
+            self.update_timelines()
             if self.pending_range:
                 row, self.pending_range = self.pending_range, None
                 self.apply_range(row)
@@ -635,7 +677,7 @@ class MainWindow(QMainWindow):
         start, end = self.review_selection if self.stage == 3 and not analysis else (parse_time(self.start_time.text()), parse_time(self.end_time.text()))
         if start >= end:
             raise ValueError(tr('끝 시각을 시작보다 뒤로 지정해 주세요.'))
-        duration = self.preview.player.duration() / 1000 if self.path else (self.remote or {}).get("duration")
+        duration = self.current_duration() if self.path else (self.remote or {}).get("duration")
         if not duration:
             raise ValueError(tr('영상 길이 안에서 구간을 선택해 주세요.'))
         if analysis:
@@ -656,7 +698,10 @@ class MainWindow(QMainWindow):
             self.fail(error)
 
     def position_changed(self, milliseconds):
-        self.update_timelines()
+        for timeline in (self.full_timeline, self.zoom_timeline):
+            timeline.position = milliseconds / 1000
+            if timeline.isVisible():
+                timeline.update()
         if self.range_end is not None and milliseconds >= self.range_end * 1000:
             index = self.range_list.currentRow()
             if self.loop_clip.isChecked() and self.stage == 3 and index >= 0:
@@ -767,7 +812,7 @@ class MainWindow(QMainWindow):
     def apply_clip_offsets(self):
         if not self.ranges or not self.path:
             return
-        duration = self.preview.player.duration() / 1000
+        duration = self.current_duration()
         if duration <= 0:
             self.status.setText(tr('영상 길이를 확인한 후 적용해 주세요.'))
             return
@@ -900,8 +945,9 @@ class MainWindow(QMainWindow):
             workers = self.analysis_workers.value()
             decoder_threads = self.decoder_threads.value()
             ocr_workers, gpu = self.ocr_workers.value(), self.gpu_decode.isChecked()
+            gpu_convert, pipelined = self.gpu_convert.isChecked(), self.analysis_pipeline.isChecked()
             self.preview.player.pause()
-            self.run_task(lambda cancel, report: analyze(path, start, end, profile, directory, cancel, report, workers=workers, decoder_threads=decoder_threads, ocr_workers=ocr_workers, gpu=gpu),
+            self.run_task(lambda cancel, report: analyze(path, start, end, profile, directory, cancel, report, workers=workers, decoder_threads=decoder_threads, ocr_workers=ocr_workers, gpu=gpu, gpu_convert=gpu_convert, pipelined=pipelined),
                           lambda result: self.analysis_finished(result, source_key(path) if choice == "replace" else None))
         except (ValueError, OSError) as error:
             self.fail(error)
@@ -926,7 +972,7 @@ class MainWindow(QMainWindow):
             row["clip_id"] = uuid4().hex
             key = source_key(row["source"])
             self.detected_ranges.setdefault(key, []).append(deepcopy(row))
-            duration = self.preview.player.duration() / 1000 if key == current else None
+            duration = self.current_duration() if key == current else None
             try:
                 row["start"], row["end"] = offset_bounds(row["start"], row["end"],
                     self.clip_start_offset.value(), self.clip_end_offset.value(), duration)
@@ -1028,10 +1074,10 @@ class MainWindow(QMainWindow):
             self.range_list.blockSignals(False)
             self.show_clip_details(index)
             self.pending_range = row
-            if self.preview.player.duration():
-                self.media_loaded(self.preview.player.duration())
+            if self.current_duration() > 0:
+                self.media_loaded(round(self.current_duration() * 1000))
             return
-        if not self.preview.player.duration():
+        if self.current_duration() <= 0:
             self.pending_range = row
             return
         self.apply_range(row)
@@ -1125,7 +1171,7 @@ class MainWindow(QMainWindow):
         self.source_info[source_key(path)] = {
             "title": metadata.get("title", "YouTube"),
             "channel": metadata.get("uploader") or metadata.get("channel") or "",
-            "date": metadata.get("video_date", tr('날짜 미제공')),
+            "date": str(metadata.get("video_date") or tr('날짜 미제공')),
             "kind": "LIVE" if metadata.get("is_live") or metadata.get("was_live") else tr('일반 동영상'),
             "range": f"{format_time(result['start'])} – {format_time(result['end'])}"}
         self.add_paths([path])
@@ -1134,6 +1180,319 @@ class MainWindow(QMainWindow):
         self.download_detail.setText(tr('다운로드 완료'))
         self.download_eta.clear()
         self.set_stage(0)
+        self.save_recovery()
+
+    def stream_protocol_changed(self):
+        protocol = self.stream_protocol.currentData()
+        if protocol == "srt" and self.stream_port.value() == 1935:
+            self.stream_port.setValue(9000)
+        elif protocol == "rtmp" and self.stream_port.value() == 9000:
+            self.stream_port.setValue(1935)
+        self.update_stream_ui()
+
+    def update_stream_ui(self, *_):
+        from stream_ingest import is_individual_youtube_live_url, obs_connection_info
+        mode = self.stream_mode.currentData()
+        self.stream_direct_panel.setVisible(mode == "direct")
+        self.stream_youtube_panel.setVisible(mode == "youtube")
+        protocol = self.stream_protocol.currentData()
+        port = self.stream_port.value()
+        host = self.stream_host.text().strip()
+        key = self.stream_key.text().strip()
+        try:
+            info = obs_connection_info(protocol, host or "127.0.0.1", port, key or "ac-0000")
+            self.stream_server_url.setText(info["server_url"])
+        except ValueError:
+            self.stream_server_url.setText("")
+        yt_url = self.stream_youtube_url.text().strip()
+        if hasattr(self, "stream_start_button"):
+            if mode == "youtube" and is_individual_youtube_live_url(yt_url):
+                self.stream_start_button.setText(tr('개별 라이브 녹화 시작'))
+            else:
+                self.stream_start_button.setText(tr('스트림 자동 수신 시작'))
+        settings = QSettings("ArcadeClip", "ArcadeClip")
+        settings.setValue("stream/mode", mode)
+        settings.setValue("stream/protocol", protocol)
+        settings.setValue("stream/port", port)
+        settings.setValue("stream/host", host)
+        settings.setValue("stream/grace_seconds", self.stream_grace.value())
+        if key:
+            settings.setValue("stream/key", key)
+        settings.setValue("stream/youtube_url", yt_url)
+        settings.setValue("stream/poll_seconds", self.stream_poll_seconds.value())
+        if hasattr(self, "stream_stop_button"):
+            self.stream_stop_button.setText(
+                tr('수신 정지 · 클립 생성') if self.stream_auto_clip.isChecked() else tr('수신 정지 · 시간 선택으로')
+            )
+        settings.setValue("stream/auto_clip_after_ingest", self.stream_auto_clip.isChecked())
+        settings.setValue("stream/auto_clip", self.stream_auto_clip.isChecked())
+
+    def paste_obs_youtube_url(self):
+        from stream_ingest import is_individual_youtube_live_url, youtube_stream_target
+        clipboard_text = QApplication.clipboard().text().strip()
+        fallback_text = self.url.text().strip() if hasattr(self, "url") else ""
+        target = None
+        for candidate in (clipboard_text, fallback_text):
+            if not candidate:
+                continue
+            try:
+                target = youtube_stream_target(candidate)
+                break
+            except ValueError:
+                continue
+        if target is None:
+            self.status.setText(tr('클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다.'))
+            return
+        self.stream_youtube_url.setText(target)
+        yt_idx = self.stream_mode.findData("youtube")
+        if yt_idx >= 0:
+            self.stream_mode.setCurrentIndex(yt_idx)
+        if is_individual_youtube_live_url(target):
+            self.status.setText(tr('개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작] 후 원하는 시점에 정지하면 시간 선택 및 인식 영역을 설정할 수 있습니다.'))
+        else:
+            self.status.setText(tr('YouTube 채널 라이브 주소를 붙여넣었습니다.'))
+
+    def stop_stream_ingest(self):
+        stop_event = getattr(self, "stream_stop_event", None)
+        if stop_event is not None and self.task:
+            stop_event.set()
+            if hasattr(self, "stream_stop_button"):
+                self.stream_stop_button.setEnabled(False)
+            if self.stream_auto_clip.isChecked():
+                self.status.setText(tr('수신을 정지하고 현재까지 녹화된 구간으로 클립 생성을 시작합니다…'))
+            else:
+                self.status.setText(tr('수신을 정지하고 녹화된 영상을 시간 선택 단계로 불러옵니다…'))
+
+    def copy_obs_stream_key(self):
+        from stream_ingest import validate_stream_key
+        try:
+            key = validate_stream_key(self.stream_key.text())
+        except ValueError as error:
+            self.fail(error)
+            return
+        QApplication.clipboard().setText(key)
+        self.status.setText(tr('스트림 키를 복사했습니다.'))
+
+    def copy_obs_server_url(self):
+        text = self.stream_server_url.text().strip()
+        if not text:
+            self.status.setText(tr('고정 주소(DDNS 또는 IP)와 스트림 키 형식을 확인해 주세요.'))
+            return
+        QApplication.clipboard().setText(text)
+        self.status.setText(tr('OBS 서버 주소를 복사했습니다.'))
+
+    def new_obs_stream_key(self):
+        from stream_ingest import generate_stream_key
+        key = generate_stream_key()
+        self.stream_key.setText(key)
+        self.status.setText(tr('새 스트림 키를 발급했습니다.'))
+
+    def show_stream_network_guide(self):
+        from PySide6.QtWidgets import QDialog, QHBoxLayout, QPlainTextEdit, QVBoxLayout
+        from stream_ingest import port_forwarding_guide
+        guide_text = port_forwarding_guide(
+            self.stream_protocol.currentData(),
+            self.stream_port.value(),
+            self.stream_host.text(),
+            self.stream_key.text(),
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr('포트포워딩 · 고정 DDNS 가이드'))
+        dialog.resize(620, 520)
+        layout = QVBoxLayout(dialog)
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(guide_text)
+        layout.addWidget(viewer, 1)
+        buttons = QHBoxLayout()
+        copy_btn = QPushButton(tr('안내문 복사'))
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(guide_text))
+        close_btn = QPushButton(tr('닫기'))
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(dialog.accept)
+        buttons.addStretch()
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def _resolve_stream_profile(self):
+        if self.preview.regions:
+            require_regions(self.preview.regions)
+            return self.profile.current_profile(require_complete=True)
+        if self.profile.saved_profile:
+            return validate_profile(deepcopy(self.profile.saved_profile))
+        profiles_dir = self.directory / "profiles"
+        if profiles_dir.is_dir():
+            for candidate in sorted(profiles_dir.glob("*.json")):
+                if candidate.name.startswith("offset-"):
+                    continue
+                try:
+                    return load_profile(candidate)
+                except (ValueError, OSError):
+                    continue
+        require_regions(self.preview.regions)
+        return None
+
+    def start_stream_ingest(self):
+        if self.task:
+            return
+        import threading
+        from stream_ingest import (
+            auto_clip_session,
+            obs_connection_info,
+            receive_direct_stream,
+            watch_youtube_stream,
+            youtube_stream_target,
+        )
+        try:
+            auto_clip = self.stream_auto_clip.isChecked()
+            profile = None
+            profile_missing = False
+            if auto_clip:
+                try:
+                    profile = self._resolve_stream_profile()
+                except ValueError:
+                    profile = None
+                    auto_clip = False
+                    profile_missing = True
+            mode = self.stream_mode.currentData()
+            streams_dir = self.directory / "streams"
+            output_dir = Path(self.output_directory.text().strip() or str(self.directory / "clips")).expanduser()
+            if self.export_date_folder.isChecked():
+                output_dir /= datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            start_offset = self.clip_start_offset.value()
+            end_offset = self.clip_end_offset.value()
+            export_settings = {
+                "mode": self.export_mode.currentData(),
+                "crf": self.encoder_crf.value(),
+                "preset": self.encoder_preset.currentText(),
+                "audio": self.export_audio,
+            }
+            if export_settings["mode"] == "accurate":
+                export_settings.update(self.export_options)
+            analysis_options = {
+                "workers": self.analysis_workers.value(),
+                "decoder_threads": self.decoder_threads.value(),
+                "ocr_workers": self.ocr_workers.value(),
+                "gpu": self.gpu_decode.isChecked(),
+                "gpu_convert": self.gpu_convert.isChecked(),
+                "pipelined": self.analysis_pipeline.isChecked(),
+            }
+            stop_event = threading.Event()
+            if mode == "direct":
+                protocol = self.stream_protocol.currentData()
+                port = self.stream_port.value()
+                host = self.stream_host.text().strip() or "127.0.0.1"
+                key = self.stream_key.text().strip()
+                grace = self.stream_grace.value()
+                obs_connection_info(protocol, host, port, key)
+
+                def operation(cancel, report):
+                    video_path = receive_direct_stream(
+                        protocol, port, key, streams_dir, cancel, report,
+                        host=host, grace_seconds=grace, stop_event=stop_event,
+                    )
+                    source_meta = {}
+                    meta_file = video_path.parent / "source.json"
+                    if meta_file.is_file():
+                        try:
+                            source_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            source_meta = {}
+                    outcome = auto_clip_session(
+                        video_path, profile, self.directory, output_dir, cancel, report,
+                        start_offset=start_offset, end_offset=end_offset,
+                        export_settings=export_settings, analysis_options=analysis_options,
+                        auto_export=auto_clip,
+                    )
+                    outcome["metadata"] = source_meta
+                    outcome["profile_missing"] = profile_missing
+                    return outcome
+            else:
+                raw_yt = self.stream_youtube_url.text().strip()
+                if not raw_yt and hasattr(self, "url") and self.url.text().strip():
+                    raw_yt = self.url.text().strip()
+                    self.stream_youtube_url.setText(raw_yt)
+                target_url = youtube_stream_target(raw_yt)
+                poll_seconds = self.stream_poll_seconds.value()
+                workers = self.download_workers.value()
+
+                def operation(cancel, report):
+                    watched = watch_youtube_stream(
+                        target_url, streams_dir, cancel, report,
+                        poll_seconds=poll_seconds, workers=workers, stop_event=stop_event,
+                    )
+                    outcome = auto_clip_session(
+                        watched["path"], profile, self.directory, output_dir, cancel, report,
+                        start_offset=start_offset, end_offset=end_offset,
+                        export_settings=export_settings, analysis_options=analysis_options,
+                        auto_export=auto_clip,
+                    )
+                    outcome["metadata"] = watched.get("metadata") or {}
+                    outcome["profile_missing"] = profile_missing
+                    return outcome
+
+            self.stream_stop_event = stop_event
+            self.preview.player.pause()
+            self.run_task(operation, self.stream_ingest_finished)
+            if hasattr(self, "stream_stop_button"):
+                self.stream_stop_button.setEnabled(True)
+        except (ValueError, OSError) as error:
+            self.fail(error)
+
+    def stream_ingest_finished(self, result):
+        path = Path(result["path"])
+        metadata = result.get("metadata") or {}
+        duration = float(result.get("duration") or metadata.get("local_duration") or 0)
+        if duration > 0:
+            self.local_durations[source_key(path)] = duration
+        self.source_info[source_key(path)] = {
+            "title": str(metadata.get("title") or "OBS Stream"),
+            "channel": metadata.get("uploader") or metadata.get("channel") or "OBS",
+            "date": str(metadata.get("video_date") or tr('날짜 미제공')),
+            "kind": "LIVE",
+            "range": f"{format_time(0)} – {format_time(duration)}",
+        }
+        self.add_paths([path])
+        self.path = path
+        if duration > 0:
+            self.preview.fallback_duration = round(duration * 1000)
+            if self.preview.player.duration() <= 0:
+                self.preview._duration_changed(self.preview.fallback_duration)
+            self.start_time.setText(format_time(0))
+            self.end_time.setText(format_time(duration))
+            self.analysis_range_summary.setText(
+                tr('분석 구간: {start} – {end}', start=self.start_time.text(), end=self.end_time.text())
+            )
+            self.update_timelines()
+        analysis = result.get("analysis") or {}
+        if analysis.get("profile"):
+            self.profile.accept_calibration(analysis["profile"])
+        key = source_key(path)
+        if result.get("originals"):
+            self.detected_ranges[key] = deepcopy(result["originals"])
+        if result.get("clips"):
+            self.ranges = deepcopy(result["clips"])
+            self.source_ranges[key] = self.ranges
+            self.refresh_ranges()
+        exported = result.get("exported") or {}
+        saved = exported.get("saved") or []
+        if saved:
+            self.last_exports = exported
+            for saved_path in saved:
+                self.log.appendPlainText(tr('저장 완료: {path}', path=saved_path))
+            self.status.setText(tr('스트림 자동 저장 및 클립 {count:,}개 추출 완료', count=len(saved)))
+            self.set_stage(3)
+        elif result.get("clips"):
+            self.status.setText(tr('구간 후보 {value1:,}개를 추가했습니다. 미리보기에서 확인해 주세요.', value1=len(result['clips'])))
+            self.set_stage(3)
+        else:
+            self.set_stage(1)
+            if result.get("profile_missing"):
+                self.status.setText(tr('스트림 저장 완료: {name} · 시간 선택 후 인식 영역을 지정해 주세요.', name=path.name))
+            else:
+                self.status.setText(tr('스트림 저장 완료: {name} · 분석할 시간 구간과 인식 영역을 선택해 주세요.', name=path.name))
         self.save_recovery()
 
     def run_task(self, operation, success, log=None):
@@ -1157,6 +1516,9 @@ class MainWindow(QMainWindow):
     def task_finished(self, success):
         self.task.wait()
         task, self.task = self.task, None
+        self.stream_stop_event = None
+        if hasattr(self, "stream_stop_button"):
+            self.stream_stop_button.setEnabled(False)
         for control in self.busy_controls:
             control.setEnabled(True)
         self.progress.hide()
@@ -1440,7 +1802,7 @@ class MainWindow(QMainWindow):
 
     def scrub(self, seconds):
         self.begin_scrub()
-        self.preview.seek(seconds)
+        self.preview.request_seek(seconds)
         low, high = self.zoom_timeline.bounds
         if self.follow_clip.isChecked() and not low <= seconds <= high:
             half = (high - low) / 2
@@ -1551,7 +1913,7 @@ class MainWindow(QMainWindow):
         elif key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
             self.scrub(self.preview.player.position() / 1000 + (-1 if key == Qt.Key.Key_PageUp else 1) * (10 if ctrl and shift else 5 if ctrl else 2 if shift else 1))
         elif key in (Qt.Key.Key_Home, Qt.Key.Key_End):
-            self.scrub(0 if key == Qt.Key.Key_Home else max(0, self.preview.player.duration() / 1000 - .001))
+            self.scrub(0 if key == Qt.Key.Key_Home else max(0, self.current_duration() - .001))
         elif key in (Qt.Key.Key_I, Qt.Key.Key_O) and not self.task and self.stage in (1, 3):
             self.mark(self.start_time if key == Qt.Key.Key_I else self.end_time)
         elif self.stage == 3 and key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal, Qt.Key.Key_Minus, Qt.Key.Key_0):
@@ -1584,6 +1946,7 @@ class MainWindow(QMainWindow):
                 self.advanced.close()
             # Same reason as Preview: the application holds every filter installed on it.
             QApplication.instance().removeEventFilter(self)
+            self.profile.release()
             self.preview.release()
             event.accept()
 

@@ -1,0 +1,2071 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -20,6 +20,9 @@
+       - uses: astral-sh/setup-uv@v10.1.0
+         with:
+           enable-cache: true
++
++      - name: Verify x64 Python architecture
++        run: uv run --locked python -c "import struct,platform; assert struct.calcsize('P') == 8 and platform.machine().lower() in ('amd64','x86_64')"
+ 
+       - name: Read the app version
+         id: version
+diff --git a/docs/develop/PERFORMANCE-X64.md b/docs/develop/PERFORMANCE-X64.md
+new file mode 100644
+--- /dev/null
++++ b/docs/develop/PERFORMANCE-X64.md
+@@ -0,0 +1,32 @@
++# Performance improvements for Windows x64
++
++Scope: GPU preview, lazy snapshots, visible-only crop updates, seek coalescing,
++selected-frame conversion, native frame lifetime, independent analysis GPU
++options and bounded ordered pipelining. Existing boundary recognition is preserved;
++CPU single-worker boundary buffering disables prefetch. No proxy or partial decode.
++
++No same-jacket cache, Free Play reset detection, ARM runtime or OCR bridge changes.
++Base: 9110b4d71cda511ac6ee3ed5b165349988de0bdb.
++Use the companion apply-improvements.py when combining the recognition and
++performance patches; it selects a verified delta for either application order.
++Image conversion switches apply to the song scan; the prerequisite's optional
++Free Play observer retains its existing conversion behavior.
++
++Build on Windows x64 using the existing run/build_windows.ps1. Visual Studio C++
++x64 tools and Windows SDK are needed to build the helper (not to run the app).
++Alternatively: python run/build_gpu_roi.py --zig <zig.exe> builds the helper only.
++The release build compiles translations, includes preview.qml / Qt Quick, builds
++the helper and copies gpu_roi_x64.dll into assets. Distribute the complete bundle.
++
++Run python run/run_tests.py --no-display for logic tests, then display tests.
++On an x64 Windows GPU machine set ARCADECLIP_TEST_GPU=1 and run test_gpu_image.
++Use verify_preview.py / verify_preview_lifecycle.py for real rendering and shutdown;
++verify_analysis_options.py / verify_gpu_analysis.py for actual source comparisons.
++Measure process memory and wall time independently of summed parallel stage times.
++
++The x64 native runtime and complete Nuitka release require real x64 validation;
++cross-compilation or source-level tests are not proof of GPU runtime success.
++The original CPU path remains available. Unsupported GPU processing warns and
++resumes on CPU. GPU conversion currently supports NV12 SDR BT.601/709 only.
++The step-3 analysis switches do not control Qt's preview renderer. For preview
++diagnostics use ARCADECLIP_PREVIEW_RENDERER=software.
+diff --git a/run/build_gpu_roi.py b/run/build_gpu_roi.py
+new file mode 100644
+--- /dev/null
++++ b/run/build_gpu_roi.py
+@@ -0,0 +1,44 @@
++"""Build the x64 D3D11 helper. MSVC by default, or --zig PATH."""
++import argparse
++import os
++from pathlib import Path
++import struct
++import subprocess
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--zig', type=Path, help='Optional Zig executable; otherwise use Visual Studio x64 tools')
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parents[1]
++    build = root / 'build/gpu-roi-x64'
++    build.mkdir(parents=True, exist_ok=True)
++    source = root / 'run/gpu_roi.c'
++    output = build / 'gpu_roi_x64.dll'
++    if args.zig:
++        subprocess.run([str(args.zig.resolve()), 'cc', '-target', 'x86_64-windows-gnu', '-O2',
++                        '-shared', str(source), '-o', str(output), '-ld3d11', '-ldxguid', '-lole32'],
++                       check=True, env=dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(build / 'zig-cache')))
++    else:
++        vswhere = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Microsoft Visual Studio/Installer/vswhere.exe'
++        installation = subprocess.check_output([str(vswhere), '-latest', '-products', '*',
++            '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property',
++            'installationPath'], text=True).strip()
++        if not installation:
++            raise RuntimeError('Visual Studio x64 C++ build tools are required')
++        setup = Path(installation) / 'VC/Auxiliary/Build/vcvars64.bat'
++        if any(c in str(root) + str(setup) for c in ('%', '\n', '\r', '"')):
++            raise ValueError('Build path contains unsupported command characters')
++        command = build / 'compile.cmd'
++        command.write_text('@echo off\nsetlocal DisableDelayedExpansion\ncall "' + str(setup) + '" >nul\n'
++            'if errorlevel 1 exit /b 1\ncl /nologo /O2 /MT /LD /TC "' + str(source) + '" '
++            '/Fo"' + str(build / 'gpu_roi.obj') + '" /link /MACHINE:X64 /OUT:"' + str(output) + '" '
++            'd3d11.lib dxguid.lib ole32.lib\nexit /b %errorlevel%\n', encoding='utf-8')
++        subprocess.run(['cmd.exe', '/d', '/c', str(command)], check=True, cwd=build)
++    data = output.read_bytes()
++    pe = struct.unpack_from('<I', data, 0x3c)[0]
++    if data[pe:pe+4] != b'PE\0\0' or struct.unpack_from('<H', data, pe+4)[0] != 0x8664:
++        raise RuntimeError('GPU helper is not an x64 PE binary')
++    print(output)
++
++if __name__ == '__main__':
++    main()
+diff --git a/run/build_windows.ps1 b/run/build_windows.ps1
+--- a/run/build_windows.ps1
++++ b/run/build_windows.ps1
+@@ -27,6 +27,8 @@
+ }
+ uv sync --locked --group build
+ if ($LASTEXITCODE -ne 0) { throw 'Dependency setup failed.' }
++uv run --locked python run/build_gpu_roi.py
++if ($LASTEXITCODE -ne 0) { throw 'x64 GPU helper build failed.' }
+ uv run --locked python run/compile_messages.py
+ if ($LASTEXITCODE -ne 0) { throw 'Translation compilation failed.' }
+ uv run --locked python run/build_manual.py
+@@ -58,14 +60,19 @@
+ Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $bundle 'LICENSE')
+ Copy-Item -LiteralPath (Join-Path $projectRoot 'DISTRIBUTION.md') -Destination (Join-Path $bundle 'DISTRIBUTION.md')
+ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'license_sources/COPYING.GPLv3') -Destination (Join-Path $bundle 'COPYING.GPLv3')
+-foreach ($asset in (Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src/assets') -File)) {
++$gpuHelper = Join-Path $projectRoot 'build/gpu-roi-x64/gpu_roi_x64.dll'
++Copy-Item -LiteralPath $gpuHelper -Destination (Join-Path $bundle 'assets/gpu_roi_x64.dll')
++if ((Get-FileHash $gpuHelper).Hash -ne (Get-FileHash (Join-Path $bundle 'assets/gpu_roi_x64.dll')).Hash) {
++    throw 'Bundled GPU helper differs from build output.'
++}
++foreach ($asset in (Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src/assets') -File | Where-Object { $_.Extension -notin @('.dll', '.pdb', '.lib') })) {
+     $bundledAsset = Join-Path $bundle (Join-Path 'assets' $asset.Name)
+     if (-not (Test-Path -LiteralPath $bundledAsset -PathType Leaf)) { throw "Bundle missing asset: $($asset.Name)" }
+     if ((Get-FileHash -LiteralPath $asset.FullName).Hash -ne (Get-FileHash -LiteralPath $bundledAsset).Hash) {
+         throw "Bundle asset differs from source: $($asset.Name)"
+     }
+ }
+-foreach ($pattern in @('qwindows.dll', '*ffmpegmediaplugin.dll', 'Qt6Multimedia.dll', 'avcodec*.dll')) {
++foreach ($pattern in @('qwindows.dll', '*ffmpegmediaplugin.dll', 'Qt6Multimedia.dll', 'Qt6Qml.dll', 'Qt6Quick.dll', 'Qt6QuickWidgets.dll', 'avcodec*.dll')) {
+     if (-not (Get-ChildItem -Path $bundle -Recurse -File -Filter $pattern)) { throw "Bundle missing Qt media dependency: $pattern" }
+ }
+ foreach ($relative in @('manual/manual.html', 'manual/guide.js', 'manual/guide.css', 'manual/images/review.png', 'locales/en/LC_MESSAGES/arcadeclip.mo', 'yt_dlp_ejs/yt/solver/core.min.js', 'yt_dlp_ejs/yt/solver/lib.min.js', 'certifi/cacert.pem', 'rapidocr/config.yaml', 'rapidocr/default_models.yaml')) {
+diff --git a/run/diagnose_decode_memory.py b/run/diagnose_decode_memory.py
+new file mode 100644
+--- /dev/null
++++ b/run/diagnose_decode_memory.py
+@@ -0,0 +1,83 @@
++"""Bounded read-only decode/convert memory probe; does not alter the app session."""
++import argparse
++import ctypes
++from ctypes import wintypes
++import gc
++import json
++from pathlib import Path
++import sys
++import time
++
++parser = argparse.ArgumentParser()
++parser.add_argument('source')
++parser.add_argument('--gpu', action='store_true')
++parser.add_argument('--convert', action='store_true')
++parser.add_argument('--collect', action='store_true')
++parser.add_argument('--metadata', action='store_true')
++parser.add_argument('--seconds', type=float, default=90)
++args = parser.parse_args()
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
++ctypes.windll.kernel32.SetErrorMode(0x8003)
++class Counters(ctypes.Structure):
++    _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
++        (name, ctypes.c_size_t) for name in ('PeakWorkingSetSize', 'WorkingSetSize',
++        'QuotaPeakPagedPoolUsage', 'QuotaPagedPoolUsage', 'QuotaPeakNonPagedPoolUsage',
++        'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage', 'PrivateUsage')]
++get_mem = ctypes.windll.psapi.GetProcessMemoryInfo
++get_mem.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
++get_mem.restype = wintypes.BOOL
++get_process = ctypes.windll.kernel32.GetCurrentProcess
++get_process.restype = wintypes.HANDLE
++def memory():
++    data = Counters()
++    data.cb = ctypes.sizeof(data)
++    if not get_mem(get_process(), ctypes.byref(data), data.cb):
++        raise ctypes.WinError()
++    return dict(private_mb=round(data.PrivateUsage/2**20, 2), rss_mb=round(data.WorkingSetSize/2**20, 2))
++import av
++from media import oriented_image
++options = {}
++if args.gpu:
++    from av.codec.hwaccel import HWAccel
++    options['hwaccel'] = HWAccel('d3d11va', allow_software_fallback=False)
++base = memory()
++began = time.perf_counter()
++print(json.dumps({'phase': 'baseline', **base, **vars(args)}), flush=True)
++container = av.open(args.source, **options)
++stream = container.streams.video[0]
++stream.thread_type = 'AUTO'
++stream.codec_context.thread_count = 8
++target = 0
++count = 0
++images = 0
++for frame in container.decode(stream):
++    count += 1
++    seconds = float(frame.pts * stream.time_base)
++    if seconds >= args.seconds:
++        break
++    if (args.convert or args.metadata) and seconds >= target:
++        if args.metadata:
++            # Isolate the metadata access at the start of oriented_image().
++            tuple(frame.side_data)
++        else:
++            image = oriented_image(frame, region=[.01, .1, .15, .3], reference_size=[2560, 1440])
++            del image
++        images += 1
++        target = seconds + 1
++    if count % 600 == 0:
++        collected = gc.collect() if args.collect else None
++        state = memory()
++        print(json.dumps({'phase': 'decode', 'frames': count, 'samples': images,
++                          'seconds': seconds, 'elapsed': round(time.perf_counter()-began, 2),
++                          'format': frame.format.name, 'collected': collected, **state}), flush=True)
++        if state['private_mb'] - base['private_mb'] > 512 or time.perf_counter()-began > 120:
++            print('STOP: bounded diagnostic limit', flush=True)
++            break
++del frame
++container.close()
++def retained_frames():
++    return sum(isinstance(obj, av.VideoFrame) for obj in gc.get_objects())
++print(json.dumps({'phase': 'closed', 'retained_frames': retained_frames(), **memory()}), flush=True)
++collected = gc.collect()
++print(json.dumps({'phase': 'collected', 'objects': collected,
++                  'retained_frames': retained_frames(), **memory()}), flush=True)
+diff --git a/run/gpu_roi.c b/run/gpu_roi.c
+new file mode 100644
+--- /dev/null
++++ b/run/gpu_roi.c
+@@ -0,0 +1,140 @@
++#define COBJMACROS
++#include <windows.h>
++#include <d3d11.h>
++#include <d3d10.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* One converter per decoding task. Input textures remain owned by PyAV. */
++typedef struct {
++    ID3D11Device *device;
++    ID3D11DeviceContext *context;
++    ID3D11VideoDevice *video;
++    ID3D11VideoContext *vc;
++    ID3D11VideoProcessorEnumerator *enumerator;
++    ID3D11VideoProcessor *processor;
++    ID3D11Texture2D *output, *staging, *upload;
++    ID3D11VideoProcessorOutputView *view;
++    UINT width, height;
++} Converter;
++
++#define RELEASE(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
++__declspec(dllexport) void ac_roi_close(Converter *s) {
++    if (!s) return;
++    RELEASE(s->view); RELEASE(s->staging); RELEASE(s->output); RELEASE(s->upload);
++    RELEASE(s->processor); RELEASE(s->enumerator); RELEASE(s->vc);
++    RELEASE(s->video); RELEASE(s->context); RELEASE(s->device);
++    free(s);
++}
++#define CHECK(call) do { hr = (call); if (FAILED(hr)) goto fail; } while (0)
++
++__declspec(dllexport) HRESULT ac_roi_open(ID3D11Texture2D *input, UINT width, UINT height, Converter **result) {
++    HRESULT hr = E_FAIL;
++    Converter *s = calloc(1, sizeof(*s));
++    if (!s) return E_OUTOFMEMORY;
++    *result = NULL;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D_GetDesc(input, &desc);
++    /* Explicitly reject unsupported/high bit depth input rather than changing colors silently. */
++    if (desc.Format != DXGI_FORMAT_NV12 || !width || !height) goto fail;
++    s->width = width; s->height = height;
++    ID3D11Texture2D_GetDevice(input, &s->device);
++    ID3D11Device_GetImmediateContext(s->device, &s->context);
++    ID3D10Multithread *multithread = NULL;
++    CHECK(ID3D11DeviceContext_QueryInterface(s->context, &IID_ID3D10Multithread, (void **)&multithread));
++    ID3D10Multithread_SetMultithreadProtected(multithread, TRUE);
++    RELEASE(multithread);
++    CHECK(ID3D11Device_QueryInterface(s->device, &IID_ID3D11VideoDevice, (void **)&s->video));
++    CHECK(ID3D11DeviceContext_QueryInterface(s->context, &IID_ID3D11VideoContext, (void **)&s->vc));
++    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {0};
++    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
++    content.InputWidth = desc.Width; content.InputHeight = desc.Height;
++    content.OutputWidth = width; content.OutputHeight = height;
++    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
++    CHECK(ID3D11VideoDevice_CreateVideoProcessorEnumerator(s->video, &content, &s->enumerator));
++    UINT support = 0;
++    CHECK(ID3D11VideoProcessorEnumerator_CheckVideoProcessorFormat(s->enumerator, DXGI_FORMAT_B8G8R8A8_UNORM, &support));
++    if (!(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) { hr = E_NOTIMPL; goto fail; }
++    CHECK(ID3D11VideoDevice_CreateVideoProcessor(s->video, s->enumerator, 0, &s->processor));
++    D3D11_TEXTURE2D_DESC out = {0};
++    out.Width = width; out.Height = height; out.MipLevels = 1; out.ArraySize = 1;
++    out.Format = DXGI_FORMAT_B8G8R8A8_UNORM; out.SampleDesc.Count = 1;
++    out.Usage = D3D11_USAGE_DEFAULT; out.BindFlags = D3D11_BIND_RENDER_TARGET;
++    CHECK(ID3D11Device_CreateTexture2D(s->device, &out, NULL, &s->output));
++    out.Usage = D3D11_USAGE_STAGING; out.BindFlags = 0; out.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    CHECK(ID3D11Device_CreateTexture2D(s->device, &out, NULL, &s->staging));
++    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC vd = {0};
++    vd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
++    CHECK(ID3D11VideoDevice_CreateVideoProcessorOutputView(s->video, (ID3D11Resource *)s->output,
++                                                         s->enumerator, &vd, &s->view));
++    *result = s;
++    return S_OK;
++fail:
++    ac_roi_close(s);
++    return hr;
++}
++
++__declspec(dllexport) HRESULT ac_roi_convert(Converter *s, ID3D11Texture2D *input, UINT slice,
++        int left, int top, int matrix709, int full_range, unsigned char *pixels, size_t size) {
++    HRESULT hr = E_FAIL;
++    ID3D11VideoProcessorInputView *view = NULL;
++    if (!s || size < (size_t)s->width * s->height * 4) return E_INVALIDARG;
++    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {0};
++    iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D; iv.Texture2D.ArraySlice = slice;
++    CHECK(ID3D11VideoDevice_CreateVideoProcessorInputView(s->video, (ID3D11Resource *)input,
++                                                        s->enumerator, &iv, &view));
++    RECT source = {left, top, left + (LONG)s->width, top + (LONG)s->height};
++    RECT dest = {0, 0, (LONG)s->width, (LONG)s->height};
++    ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(s->vc, s->processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
++    ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(s->vc, s->processor, 0, FALSE);
++    ID3D11VideoContext_VideoProcessorSetStreamSourceRect(s->vc, s->processor, 0, TRUE, &source);
++    ID3D11VideoContext_VideoProcessorSetStreamDestRect(s->vc, s->processor, 0, TRUE, &dest);
++    ID3D11VideoContext_VideoProcessorSetOutputTargetRect(s->vc, s->processor, TRUE, &dest);
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs = {0};
++    cs.YCbCr_Matrix = !!matrix709;
++    cs.Nominal_Range = full_range ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
++    ID3D11VideoContext_VideoProcessorSetStreamColorSpace(s->vc, s->processor, 0, &cs);
++    memset(&cs, 0, sizeof(cs)); cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
++    ID3D11VideoContext_VideoProcessorSetOutputColorSpace(s->vc, s->processor, &cs);
++    D3D11_VIDEO_PROCESSOR_STREAM stream = {0};
++    stream.Enable = TRUE; stream.pInputSurface = view;
++    CHECK(ID3D11VideoContext_VideoProcessorBlt(s->vc, s->processor, s->view, 0, 1, &stream));
++    ID3D11DeviceContext_CopyResource(s->context, (ID3D11Resource *)s->staging, (ID3D11Resource *)s->output);
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    CHECK(ID3D11DeviceContext_Map(s->context, (ID3D11Resource *)s->staging, 0, D3D11_MAP_READ, 0, &mapped));
++    for (UINT y = 0; y < s->height; ++y)
++        memcpy(pixels + (size_t)y*s->width*4, (char *)mapped.pData + (size_t)y*mapped.RowPitch, (size_t)s->width*4);
++    ID3D11DeviceContext_Unmap(s->context, (ID3D11Resource *)s->staging, 0);
++fail:
++    RELEASE(view);
++    return hr;
++}
++
++__declspec(dllexport) HRESULT ac_roi_open_cpu(UINT width, UINT height, UINT out_width,
++        UINT out_height, Converter **result) {
++    HRESULT hr;
++    ID3D11Device *device = NULL;
++    ID3D11Texture2D *input = NULL;
++    *result = NULL;
++    CHECK(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
++        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL));
++    D3D11_TEXTURE2D_DESC desc = {0};
++    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
++    desc.Format = DXGI_FORMAT_NV12; desc.SampleDesc.Count = 1;
++    desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_DECODER;
++    CHECK(ID3D11Device_CreateTexture2D(device, &desc, NULL, &input));
++    CHECK(ac_roi_open(input, out_width, out_height, result));
++    (*result)->upload = input;
++    input = NULL;
++fail:
++    RELEASE(input); RELEASE(device);
++    return hr;
++}
++
++__declspec(dllexport) HRESULT ac_roi_convert_cpu(Converter *s, const void *nv12, UINT pitch,
++        int left, int top, int matrix709, int full_range, unsigned char *pixels, size_t size) {
++    if (!s || !s->upload || !nv12) return E_INVALIDARG;
++    ID3D11DeviceContext_UpdateSubresource(s->context, (ID3D11Resource *)s->upload,
++                                        0, NULL, nv12, pitch, 0);
++    return ac_roi_convert(s, s->upload, 0, left, top, matrix709, full_range, pixels, size);
++}
+diff --git a/run/pysidedeploy.spec b/run/pysidedeploy.spec
+--- a/run/pysidedeploy.spec
++++ b/run/pysidedeploy.spec
+@@ -11,11 +11,11 @@
+ packages = Nuitka==4.2.1
+ 
+ [qt]
+-qml_files =
++qml_files = src/assets/preview.qml
+ excluded_qml_plugins =
+-modules = Core,Gui,Widgets,Multimedia
++modules = Core,Gui,Widgets,Multimedia,Qml,Quick,QuickWidgets
+ plugins = platforms,multimedia
+ 
+ [nuitka]
+ mode = standalone
+-extra_args = --quiet --windows-console-mode=attach --include-data-dir=src/assets=assets --include-data-dir=docs/manual=manual --include-data-dir=src/locales=locales --include-data-files=src/licenses.json=licenses.json --nofollow-import-to=yt_dlp.extractor._extractors --nofollow-import-to=yt_dlp.extractor.lazy_extractors --include-package=yt_dlp.downloader --include-package=yt_dlp.postprocessor --include-package=yt_dlp.networking --include-package=yt_dlp.extractor.youtube --include-module=yt_dlp.extractor.generic --include-package=yt_dlp_ejs --include-package-data=yt_dlp_ejs --include-package=rapidocr --include-package-data=rapidocr --include-package=onnxruntime --include-package-data=onnxruntime --include-package-data=certifi --include-distribution-metadata=yt-dlp --include-distribution-metadata=yt-dlp-ejs --noinclude-dlls=cv2/opencv_videoio_ffmpeg*.dll --assume-yes-for-downloads --report=.validation-data/windows-build-report.xml
++extra_args = --quiet --windows-console-mode=attach --include-data-dir=src/assets=assets --noinclude-data-files=assets/*.dll --noinclude-data-files=assets/*.pdb --noinclude-data-files=assets/*.lib --include-data-dir=docs/manual=manual --include-data-dir=src/locales=locales --include-data-files=src/licenses.json=licenses.json --nofollow-import-to=yt_dlp.extractor._extractors --nofollow-import-to=yt_dlp.extractor.lazy_extractors --include-package=yt_dlp.downloader --include-package=yt_dlp.postprocessor --include-package=yt_dlp.networking --include-package=yt_dlp.extractor.youtube --include-module=yt_dlp.extractor.generic --include-package=yt_dlp_ejs --include-package-data=yt_dlp_ejs --include-package=rapidocr --include-package-data=rapidocr --include-package=onnxruntime --include-package-data=onnxruntime --include-package-data=certifi --include-distribution-metadata=yt-dlp --include-distribution-metadata=yt-dlp-ejs --noinclude-dlls=cv2/opencv_videoio_ffmpeg*.dll --assume-yes-for-downloads --report=.validation-data/windows-build-report.xml
+diff --git a/run/verify_analysis_options.py b/run/verify_analysis_options.py
+new file mode 100644
+--- /dev/null
++++ b/run/verify_analysis_options.py
+@@ -0,0 +1,46 @@
++"""Short actual-source option matrix; no fallback may hide a failed GPU mode."""
++import ctypes
++import gc
++import json
++from pathlib import Path
++import sys
++import threading
++import time
++
++root = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(Path(sys.argv[2]) / 'src') if len(sys.argv) > 2 else str(root / 'src'))
++ctypes.windll.kernel32.SetErrorMode(0x8003)
++import numpy as np
++from video_sampling import samples
++from pipeline import prefetch
++
++results = []
++reference = None
++for decode in (False, True):
++    for convert in (False, True):
++        for pipeline in (False, True):
++            cancel = threading.Event()
++            metrics = dict(decode_s=0., convert_s=0., decoded_frames=0, sample_frames=0)
++            began = time.perf_counter()
++            source = samples(sys.argv[1], 0, 10, 1, cancel, gpu=decode, gpu_convert=convert,
++                             pipelined=pipeline, decoder_threads=8, metrics=metrics,
++                             region=[.01, .1, .15, .3])
++            if pipeline:
++                source = prefetch(source, cancel)
++            rows = list(source)
++            assert len(rows) == 10
++            if reference is None:
++                reference = rows
++            assert [t for t, _ in rows] == [t for t, _ in reference]
++            error = max(float(np.abs(np.asarray(left).astype(float)-np.asarray(right)).mean())
++                        for (_, left), (_, right) in zip(reference, rows))
++            assert error < 5, error
++            assert metrics['converter'].startswith('GPU') == convert
++            assert metrics['decoder'].startswith('GPU') == decode
++            record = dict(gpu_decode=decode, gpu_convert=convert, pipeline=pipeline,
++                          wall_s=round(time.perf_counter()-began, 3), max_mae=error, **metrics)
++            results.append(record)
++            print(json.dumps(record), flush=True)
++            del rows
++            gc.collect()
++(root / '.validation-data/analysis-options-matrix.json').write_text(json.dumps(results, indent=2))
+diff --git a/run/verify_gpu_analysis.py b/run/verify_gpu_analysis.py
+new file mode 100644
+--- /dev/null
++++ b/run/verify_gpu_analysis.py
+@@ -0,0 +1,75 @@
++"""Measure selected-frame GPU conversion on an actual source, with memory bounds."""
++import argparse
++import ctypes
++from ctypes import wintypes
++import gc
++import json
++from pathlib import Path
++import sys
++import threading
++import time
++
++parser = argparse.ArgumentParser()
++parser.add_argument('source')
++parser.add_argument('--seconds', type=float, default=120)
++parser.add_argument('--output', type=Path, required=True)
++parser.add_argument('--bundle', type=Path)
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str((args.bundle or root) / 'src'))
++ctypes.windll.kernel32.SetErrorMode(0x8003)
++class Counters(ctypes.Structure):
++    _fields_ = [('cb', wintypes.DWORD), ('faults', wintypes.DWORD)] + [
++        (name, ctypes.c_size_t) for name in ('peak', 'rss', 'a', 'b', 'c', 'd', 'page', 'page_peak', 'private')]
++get_mem = ctypes.windll.psapi.GetProcessMemoryInfo
++get_mem.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
++get_process = ctypes.windll.kernel32.GetCurrentProcess
++get_process.restype = wintypes.HANDLE
++def memory():
++    data = Counters()
++    data.cb = ctypes.sizeof(data)
++    if not get_mem(get_process(), ctypes.byref(data), data.cb):
++        raise ctypes.WinError()
++    return round(data.private / 2**20, 2)
++
++import av
++import numpy as np
++from video_sampling import samples
++from media import frame_at
++from jacket_recognition import phash
++
++region = [.01, .1, .15, .3]
++metrics = dict(decode_s=0., convert_s=0., decoded_frames=0, sample_frames=0)
++points, comparisons = [], []
++began = time.perf_counter()
++count = 0
++for seconds, image in samples(args.source, 0, args.seconds, 1, threading.Event(),
++                             gpu=True, decoder_threads=8, metrics=metrics, region=region,
++                             reference_size=[2560, 1440]):
++    count += 1
++    if count in (1, 31, 61):
++        reference = frame_at(Path(args.source), seconds, region=region, reference_size=[2560, 1440])['image']
++        delta = np.abs(np.asarray(image).astype(float)-np.asarray(reference))
++        comparisons.append(dict(seconds=seconds, mae=float(delta.mean()), max=float(delta.max()),
++                                phash_distance=(phash(image)^phash(reference)).bit_count()))
++        assert image.size == reference.size
++        assert delta.mean() < 5, comparisons[-1]
++        del reference, delta
++    if count % 10 == 0:
++        point = dict(samples=count, private_mb=memory(), elapsed=round(time.perf_counter()-began, 2))
++        points.append(point)
++        print(json.dumps(point), flush=True)
++        if point['private_mb'] > 800:
++            raise AssertionError('Memory safety limit exceeded')
++    del image
++gc.collect()
++result = dict(metrics=metrics, points=points, comparisons=comparisons, final_mb=memory(),
++              retained_frames=sum(isinstance(obj, av.VideoFrame) for obj in gc.get_objects()))
++assert count == int(args.seconds), (count, args.seconds)
++assert metrics['sample_frames'] == count
++assert metrics['decoded_frames'] > count*50
++assert metrics['converter'].startswith('GPU')
++if len(points) > 4:
++    assert max(p['private_mb'] for p in points[2:])-min(p['private_mb'] for p in points[2:]) < 100, points
++args.output.write_text(json.dumps(result, indent=2), encoding='utf-8')
++print(json.dumps(result), flush=True)
+diff --git a/run/verify_preview.py b/run/verify_preview.py
+new file mode 100644
+--- /dev/null
++++ b/run/verify_preview.py
+@@ -0,0 +1,89 @@
++"""Visible native preview smoke; run using the x64 Python with project dependencies.
++
++python run/verify_preview.py VIDEO --output .validation-data/preview --seconds 5
++Uses repository sources unless --bundle is supplied. Does not touch user settings.
++"""
++import argparse
++import ctypes
++import json
++import os
++from pathlib import Path
++import platform
++import sys
++import time
++
++parser = argparse.ArgumentParser()
++parser.add_argument('video', type=Path)
++parser.add_argument('--output', type=Path, required=True)
++parser.add_argument('--seconds', type=float, default=5)
++parser.add_argument('--bundle', type=Path)
++args = parser.parse_args()
++if os.name == 'nt':
++    # A failing diagnostic must return its native exit status, not leave a modal
++    # Windows Error Reporting dialog blocking the user's desktop.
++    ctypes.windll.kernel32.SetErrorMode(0x8003)
++root = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str((args.bundle or root) / 'src'))
++os.environ.setdefault('QSG_INFO', '1')
++from PySide6.QtCore import QTimer, QPointF
++from PySide6.QtWidgets import QApplication
++from PySide6.QtTest import QTest
++from PySide6.QtCore import QPoint, Qt
++from preview import Preview
++
++app = QApplication([])
++preview = Preview()
++preview.resize(1100, 720)
++preview.show()
++frames = []
++errors = []
++preview.frameChanged.connect(lambda: frames.append((time.perf_counter(), preview.frame_time)))
++preview.player.errorOccurred.connect(lambda code, message: errors.append(message))
++preview.load(args.video.resolve())
++preview.set_regions({'jacket': [.3, .3, .6, .6]})
++preview.set_region_kind('jacket')
++preview.player.play()
++started = time.perf_counter()
++
++def manipulate():
++    anchor = QPointF(preview.canvas.rect().center())
++    before = preview.canvas.normalized_point(anchor)
++    preview.canvas.zoom(1.5, anchor)
++    assert preview.canvas.normalized_point(anchor) == before
++    preview.canvas.pan += QPointF(30, 20)
++    preview.canvas.update()
++    rect = preview.canvas.video_rect()
++    start = QPoint(round(rect.x() + rect.width() * .4), round(rect.y() + rect.height() * .4))
++    end = QPoint(round(rect.x() + rect.width() * .6), round(rect.y() + rect.height() * .6))
++    QTest.mousePress(preview.canvas, Qt.MouseButton.LeftButton, pos=start)
++    QTest.mouseRelease(preview.canvas, Qt.MouseButton.LeftButton, pos=end)
++    assert all(abs(a-b) < .005 for a, b in zip(preview.regions['jacket'], [.4, .4, .6, .6]))
++    preview.player.play()
++
++def finish():
++    preview.player.pause()
++    elapsed = time.perf_counter() - started
++    args.output.mkdir(parents=True, exist_ok=True)
++    widget = preview.canvas.video_widget
++    result = {
++        'architecture': platform.machine(), 'platform': app.platformName(),
++        'renderer': 'quick' if widget else 'software',
++        'graphics_api': str(widget.quickWindow().rendererInterface().graphicsApi()) if widget else None,
++        'elapsed': elapsed, 'frames': len([v for _, v in frames if v is not None]),
++        'last_pts': preview.frame_time, 'cpu_snapshots': preview.canvas.snapshot_count,
++        'width': preview.canvas.image_size.width(), 'height': preview.canvas.image_size.height(),
++        'errors': errors, 'regions': preview.regions,
++    }
++    # Read back only for the test artifact, after measuring normal playback.
++    if widget:
++        widget.grabFramebuffer().save(str(args.output / 'gpu-frame.png'))
++    preview.grab().save(str(args.output / 'preview.png'))
++    (args.output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
++    print(json.dumps(result), flush=True)
++    preview.clear()
++    preview.close()
++    app.exit(0 if result['frames'] > 10 and not errors and widget and result['cpu_snapshots'] == 0 else 1)
++
++QTimer.singleShot(1500, manipulate)
++QTimer.singleShot(round(args.seconds * 1000), finish)
++sys.exit(app.exec())
+diff --git a/run/verify_preview_lifecycle.py b/run/verify_preview_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/run/verify_preview_lifecycle.py
+@@ -0,0 +1,87 @@
++"""Native GPU orientation, source-switch and teardown regression smoke."""
++import ctypes
++import os
++from pathlib import Path
++import sys
++import time
++
++if os.name == 'nt':
++    ctypes.windll.kernel32.SetErrorMode(0x8003)
++root = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(root / 'src'))
++from PySide6.QtCore import Qt
++from PySide6.QtGui import QImage
++from PySide6.QtMultimedia import QVideoFrame, QtVideo
++from PySide6.QtTest import QTest
++from PySide6.QtWidgets import QApplication
++from preview import Preview
++from profile_panel import ProfilePanel
++
++app = QApplication([])
++app.setQuitOnLastWindowClosed(False)
++source = root / '.validation-data/preview-1080p60.mp4'
++
++def wait_for(condition, seconds=5):
++    deadline = time.monotonic() + seconds
++    while not condition() and time.monotonic() < deadline:
++        QTest.qWait(20)
++    assert condition(), 'Native preview deadline exceeded'
++
++for cycle in range(4):
++    preview = Preview()
++    panel = ProfilePanel(preview)
++    panel.name.setText('Lifecycle check')
++    preview.resize(900, 600)
++    preview.show()
++    panel.show()
++    assert preview.canvas.video_widget is not None
++    try:
++        for switch in range(3):
++            preview.load(source)
++            preview.set_regions({'jacket': [.25, .25, .75, .75]})
++            panel.kind.setCurrentIndex(panel.kind.findData('jacket'))
++            preview.player.play()
++            wait_for(lambda: preview.frame_time is not None and preview.frame_time > .1)
++            panel.hide()
++            count = preview.canvas.snapshot_count
++            QTest.qWait(100)
++            assert preview.canvas.snapshot_count == count
++            panel.show()
++        preview.clear()
++        # Check the renderer against the CPU orientation contract using colored
++        # quadrants, presentation rotation and mirroring.
++        image = QImage(160, 80, QImage.Format.Format_RGB32)
++        for y in range(80):
++            for x in range(160):
++                image.setPixelColor(x, y, Qt.GlobalColor.red if x < 80 else Qt.GlobalColor.blue)
++        for rotation in (QtVideo.Rotation.None_, QtVideo.Rotation.Clockwise90,
++                         QtVideo.Rotation.Clockwise180, QtVideo.Rotation.Clockwise270):
++            for mirrored in (False, True):
++                frame = QVideoFrame(image)
++                frame.setRotation(rotation)
++                frame.setMirrored(mirrored)
++                preview.canvas.set_frame(frame)
++                preview.canvas.video_sink.setVideoFrame(frame)
++                QTest.qWait(50)
++                expected = preview.canvas.image
++                rendered = preview.canvas.video_widget.grabFramebuffer()
++                rect = preview.canvas.video_rect()
++                scale = rendered.width() / preview.canvas.width()
++                for u, v in ((.25, .25), (.75, .25), (.25, .75), (.75, .75)):
++                    a = expected.pixelColor(int(u * expected.width()), int(v * expected.height()))
++                    b = rendered.pixelColor(round((rect.x()+u*rect.width())*scale),
++                                            round((rect.y()+v*rect.height())*scale))
++                    assert abs(a.red()-b.red()) < 12 and abs(a.blue()-b.blue()) < 12, (rotation, mirrored, a, b)
++        # Close while both media players are active, not only after an idle test.
++        preview.load(source)
++        preview.player.play()
++        wait_for(lambda: preview.frame_time is not None)
++    finally:
++        panel.release()
++        panel.close()
++        preview.close()
++        panel.deleteLater()
++        preview.deleteLater()
++        QTest.qWait(100)
++    print(f'cycle {cycle + 1}: source switches, orientation/mirror, hidden crops, close OK', flush=True)
++print('GPU_LIFECYCLE_OK', flush=True)
+diff --git a/src/advanced_settings.py b/src/advanced_settings.py
+--- a/src/advanced_settings.py
++++ b/src/advanced_settings.py
+@@ -85,8 +85,7 @@
+     window.analysis_workers.show()
+     form.addRow(tr('글자 인식 작업자 (각 2 CPU 스레드)'), window.ocr_workers)
+     window.ocr_workers.show()
+-    form.addRow(window.gpu_decode)
+-    window.gpu_decode.show()
++    form.addRow(QLabel(tr('GPU·겹쳐 처리 옵션은 3번 인식 영역 화면에서 변경합니다.')))
+     reading.addWidget(performance)
+     performance_hint = QLabel(tr('분석 성능 설정은 다음 분석부터 적용됩니다.'))
+     performance_hint.setWordWrap(True)
+diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -252,7 +252,7 @@
+             self.analysis_metrics.setText(
+                 tr(
+                     '{value1} · 디코더 {decoder_threads}스레드 · 디코딩 {decode_s:.2f}s · 이미지 변환 {convert_s:.2f}s · 판독 누적 {match_s:.2f}s · 디코딩 {decoded_frames:,}장 / 샘플 {sample_frames:,}장',
+-                    value1=metrics.get('decoder', 'CPU'),
++                    value1=metrics.get('decoder', 'CPU') + (' / ' + metrics['converter'] if metrics.get('converter') else ''),
+                     decoder_threads=metrics['decoder_threads'],
+                     decode_s=metrics['decode_s'],
+                     convert_s=metrics['convert_s'],
+@@ -656,7 +656,10 @@
+             self.fail(error)
+ 
+     def position_changed(self, milliseconds):
+-        self.update_timelines()
++        for timeline in (self.full_timeline, self.zoom_timeline):
++            timeline.position = milliseconds / 1000
++            if timeline.isVisible():
++                timeline.update()
+         if self.range_end is not None and milliseconds >= self.range_end * 1000:
+             index = self.range_list.currentRow()
+             if self.loop_clip.isChecked() and self.stage == 3 and index >= 0:
+@@ -900,8 +903,9 @@
+             workers = self.analysis_workers.value()
+             decoder_threads = self.decoder_threads.value()
+             ocr_workers, gpu = self.ocr_workers.value(), self.gpu_decode.isChecked()
++            gpu_convert, pipelined = self.gpu_convert.isChecked(), self.analysis_pipeline.isChecked()
+             self.preview.player.pause()
+-            self.run_task(lambda cancel, report: analyze(path, start, end, profile, directory, cancel, report, workers=workers, decoder_threads=decoder_threads, ocr_workers=ocr_workers, gpu=gpu),
++            self.run_task(lambda cancel, report: analyze(path, start, end, profile, directory, cancel, report, workers=workers, decoder_threads=decoder_threads, ocr_workers=ocr_workers, gpu=gpu, gpu_convert=gpu_convert, pipelined=pipelined),
+                           lambda result: self.analysis_finished(result, source_key(path) if choice == "replace" else None))
+         except (ValueError, OSError) as error:
+             self.fail(error)
+@@ -1440,7 +1444,7 @@
+ 
+     def scrub(self, seconds):
+         self.begin_scrub()
+-        self.preview.seek(seconds)
++        self.preview.request_seek(seconds)
+         low, high = self.zoom_timeline.bounds
+         if self.follow_clip.isChecked() and not low <= seconds <= high:
+             half = (high - low) / 2
+@@ -1584,6 +1588,7 @@
+                 self.advanced.close()
+             # Same reason as Preview: the application holds every filter installed on it.
+             QApplication.instance().removeEventFilter(self)
++            self.profile.release()
+             self.preview.release()
+             event.accept()
+ 
+diff --git a/src/assets/preview.qml b/src/assets/preview.qml
+new file mode 100644
+--- /dev/null
++++ b/src/assets/preview.qml
+@@ -0,0 +1,23 @@
++import QtQuick
++import QtMultimedia
++
++Rectangle {
++    color: "#10141b"
++    clip: true
++    property alias videoSink: output.videoSink
++    property real videoX: 0
++    property real videoY: 0
++    property real videoWidth: width
++    property real videoHeight: height
++    VideoOutput {
++        id: output
++        x: videoX
++        y: videoY
++        width: videoWidth
++        height: videoHeight
++        // The canvas computes the oriented source-pixel rectangle, shared with
++        // normalized OCR regions. Do not apply a second aspect-ratio transform.
++        fillMode: VideoOutput.Stretch
++        endOfStreamPolicy: VideoOutput.KeepLastFrame
++    }
++}
+diff --git a/src/gpu_image.py b/src/gpu_image.py
+new file mode 100644
+--- /dev/null
++++ b/src/gpu_image.py
+@@ -0,0 +1,90 @@
++"""D3D11 GPU ROI/color conversion; download only the selected BGRA rectangle."""
++import ctypes
++from pathlib import Path
++import platform
++from PIL import Image
++
++
++class GPUImageConverter:
++    def __init__(self):
++        if platform.system() != 'Windows' or platform.machine().lower() not in ('amd64', 'x86_64') or ctypes.sizeof(ctypes.c_void_p) != 8:
++            raise NotImplementedError('D3D11 image conversion requires the x64 Windows helper')
++        try:
++            self.dll = ctypes.CDLL(str(Path(__file__).parent / 'assets/gpu_roi_x64.dll'))
++        except OSError as error:
++            raise RuntimeError('D3D11 image conversion helper could not be loaded') from error
++        ptr, uint = ctypes.c_void_p, ctypes.c_uint
++        self.dll.ac_roi_open.argtypes = [ptr, uint, uint, ctypes.POINTER(ptr)]
++        self.dll.ac_roi_open.restype = ctypes.c_int32
++        self.dll.ac_roi_convert.argtypes = [ptr, ptr, uint, ctypes.c_int, ctypes.c_int,
++                                           ctypes.c_int, ctypes.c_int, ptr, ctypes.c_size_t]
++        self.dll.ac_roi_convert.restype = ctypes.c_int32
++        self.dll.ac_roi_open_cpu.argtypes = [uint, uint, uint, uint, ctypes.POINTER(ptr)]
++        self.dll.ac_roi_open_cpu.restype = ctypes.c_int32
++        self.dll.ac_roi_convert_cpu.argtypes = self.dll.ac_roi_convert.argtypes
++        self.dll.ac_roi_convert_cpu.restype = ctypes.c_int32
++        self.dll.ac_roi_close.argtypes = [ptr]
++        self.dll.ac_roi_close.restype = None
++        self.handle = ptr()
++        self.key = None
++        self.buffer = None
++
++    @staticmethod
++    def check(result):
++        if result < 0:
++            raise RuntimeError(f'D3D11 image conversion failed: HRESULT 0x{result & 0xffffffff:08x}')
++
++    def convert(self, frame, *, region=None, reference_size=None):
++        from media import image_geometry
++        angle, width, height, box = image_geometry(frame, region, reference_size)
++        hardware = frame.format.name == 'd3d11'
++        # Current hardware helper supports SDR BT.601/709, not HDR/BT.2020.
++        if frame.colorspace not in (0, 1, 2, 5, 6) or frame.color_trc in (16, 18):
++            raise NotImplementedError('GPU color conversion does not support this color space')
++        x0, y0, x1, y1 = box or (0, 0, width, height)
++        # PIL rotation is counter-clockwise; map display ROI back to source pixels.
++        angle %= 360
++        if angle == 90:
++            x0, y0, x1, y1 = frame.width-y1, x0, frame.width-y0, x1
++        elif angle == 180:
++            x0, y0, x1, y1 = frame.width-x1, frame.height-y1, frame.width-x0, frame.height-y0
++        elif angle == 270:
++            x0, y0, x1, y1 = y0, frame.height-x1, y1, frame.height-x0
++        size = x1-x0, y1-y0
++        if min(size) <= 0 or x0 < 0 or y0 < 0 or x1 > frame.width or y1 > frame.height:
++            raise ValueError('Image region is outside the video frame')
++        key = (hardware, frame.width, frame.height, size)
++        if key != self.key:
++            self.close()
++            if hardware:
++                self.check(self.dll.ac_roi_open(frame.planes[0].buffer_ptr, *size, ctypes.byref(self.handle)))
++            else:
++                if frame.width % 2 or frame.height % 2:
++                    raise NotImplementedError('GPU upload requires even frame dimensions')
++                self.check(self.dll.ac_roi_open_cpu(frame.width, frame.height, *size, ctypes.byref(self.handle)))
++            self.buffer = ctypes.create_string_buffer(size[0]*size[1]*4)
++            self.key = key
++        if hardware:
++            convert = self.dll.ac_roi_convert
++            texture, slice_index = frame.planes[0].buffer_ptr, frame.planes[1].buffer_ptr
++        else:
++            # Repack selected YUV frames only; RGB conversion/cropping stays on GPU.
++            nv12 = frame.reformat(format='nv12')
++            data = b''.join(memoryview(plane)[row*plane.line_size:row*plane.line_size+frame.width]
++                            for plane in nv12.planes for row in range(plane.height))
++            upload = ctypes.create_string_buffer(data)
++            texture, slice_index = ctypes.cast(upload, ctypes.c_void_p), frame.width
++            convert = self.dll.ac_roi_convert_cpu
++        self.check(convert(self.handle, texture, slice_index, x0, y0,
++                                          frame.colorspace == 1, frame.color_range == 2,
++                                          self.buffer, len(self.buffer)))
++        # GPU already produced RGB channels; Pillow only unpacks BGRA byte layout.
++        image = Image.frombytes('RGB', size, self.buffer.raw, 'raw', 'BGRX')
++        return image.rotate(angle, expand=True) if angle else image
++
++    def close(self):
++        if self.handle:
++            self.dll.ac_roi_close(self.handle)
++            self.handle = ctypes.c_void_p()
++        self.buffer = None
++        self.key = None
+diff --git a/src/jacket_recognition.py b/src/jacket_recognition.py
+--- a/src/jacket_recognition.py
++++ b/src/jacket_recognition.py
+@@ -216,6 +216,7 @@
+         assert workers == 1
+         batch_size = 1
+     first = [head, *islice(frames, batch_size - 1)]
++    head = None
+     reason = tr(' · 이미지 메모리 상한 적용') if workers < min(requested, 61) else ""
+     update(0, tr(
+         '곡 판독 · 요청 {requested} / 최대 {workers}작업자 · 묶음 {batch_size}장{reason}',
+@@ -227,9 +228,11 @@
+     batches = iter(lambda: list(islice(frames, batch_size)), [])
+     if workers == 1:
+         results = match(first)
++        first.clear()
+         update(len(results), tr('곡 판독 · 판독 작업자 1개'))
+         for batch in batches:
+             results.extend(match(batch))
++            batch.clear()
+             if on_observation is None or len(results) % 16 == 0:
+                 update(len(results), tr('곡 판독 · 판독 작업자 1개'))
+         log_queue(len(results), True)
+@@ -241,6 +244,7 @@
+     pending, results, observed_pids = deque(), [], set()
+     try:
+         pending.append(pool.submit(_worker_batch, first))
++        first = None
+         exhausted = False
+         while pending:
+             check_cancel(cancel)
+@@ -322,7 +326,8 @@
+     return anchors[index][1]
+ 
+ 
+-def detect(path, start, end, profile, directory, cancel, report, *, workers=0, decoder_threads=0, gpu=False):
++def detect(path, start, end, profile, directory, cancel, report, *, workers=0, decoder_threads=0, gpu=False,
++           gpu_convert=None, pipelined=False):
+     options = {**DEFAULTS, **profile.get("recognition", {})}
+     result = {"warnings": [], "profile": profile}
+     progress(report, 1, 0, None, tr('자켓 목록 준비'))
+@@ -358,6 +363,9 @@
+     # ponytail: synchronous CPU only; asynchronous workers need per-batch frame ownership.
+     buffer = (BoundaryBuffer(start, options["sample_seconds"], profile["regions"]["jacket"],
+                              profile["size"], cancel) if count == 1 and not gpu else None)
++    # Keep the existing synchronous boundary observer/match ownership unchanged.
++    pipelined = pipelined and buffer is None
++    metrics['pipelined'] = pipelined
+     def rectangle(region, seconds):
+         if anchors:
+             return location_at(anchors, seconds)
+@@ -367,17 +375,28 @@
+     def frames():
+         for seconds, image in analysis_samples(path, start, end, options["sample_seconds"], cancel,
+                                                 threads, metrics, gpu, report, result["warnings"],
++                                                gpu_convert=gpu_convert, pipelined=pipelined,
+                                                 region=profile["regions"]["jacket"], reference_size=profile["size"],
+                                                 on_frame=buffer.observe if buffer else None):
+             yield seconds, image, rectangle(image, seconds)
+-    observations = scan_jackets(frames(), catalog, options, cancel, count, report,
+-                                total=math.ceil((end - start) / options["sample_seconds"]), metrics=metrics,
+-                                on_observation=buffer.matched if buffer else None)
++    source = frames()
++    if pipelined:
++        from pipeline import prefetch
++        source = prefetch(source, cancel, capacity=2)
++    try:
++        observations = scan_jackets(source, catalog, options, cancel, count, report,
++                                    total=math.ceil((end - start) / options["sample_seconds"]), metrics=metrics,
++                                    on_observation=buffer.matched if buffer else None)
++    finally:
++        source.close()
++        if buffer:
++            buffer.finish_scan()
+     if buffer:
+         buffer.finish_scan()
+         result["boundary_buffer"] = buffer.metrics
+     progress(report, 3, len(observations), len(observations), tr('곡 판독 완료'), metrics=dict(metrics))
+     candidates = _candidates(observations, start, end, options["stable_seconds"])
++    del observations
+     progress(report, 4, 0, max(1, len(candidates) - 1), tr('곡 경계 정밀 확인'))
+     # Refine only short windows around observed changes; do not repeatedly seek the full scan.
+     for index in range(1, len(candidates)):
+diff --git a/src/locales/en/LC_MESSAGES/arcadeclip.po b/src/locales/en/LC_MESSAGES/arcadeclip.po
+--- a/src/locales/en/LC_MESSAGES/arcadeclip.po
++++ b/src/locales/en/LC_MESSAGES/arcadeclip.po
+@@ -2855,3 +2855,27 @@
+ 
+ msgid "인증서를 다시 확인하고 있습니다. 앱에 포함된 인증서로 한 번 더 연결합니다."
+ msgstr "Checking certificates again. Retrying once with the certificates included in the app."
++
++msgid "GPU 영상 디코딩"
++msgstr "GPU video decoding"
++
++msgid "GPU 이미지 변환"
++msgstr "GPU image conversion"
++
++msgid "디코딩·변환·판독 겹쳐 처리"
++msgstr "Overlap decoding, conversion and recognition"
++
++msgid "실험용 D3D11VA 디코딩. 지원하지 않으면 CPU로 복귀합니다."
++msgstr "Experimental D3D11VA decoding. Falls back to CPU when unsupported."
++
++msgid "선택된 프레임의 영역·색상 변환에 GPU를 사용합니다."
++msgstr "Use the GPU to crop and convert colors of selected frames."
++
++msgid "대기 프레임 수를 제한합니다. 기존 CPU 경계 버퍼 사용 시 순차 처리합니다."
++msgstr "Limits queued frames. Runs sequentially when the existing CPU boundary buffer is used."
++
++msgid "GPU·겹쳐 처리 옵션은 3번 인식 영역 화면에서 변경합니다."
++msgstr "Change GPU and overlap options in step 3, Recognition regions."
++
++msgid "GPU 처리를 사용할 수 없어 CPU로 계속합니다: {error}"
++msgstr "GPU processing is unavailable; continuing on CPU: {error}"
+diff --git a/src/media.py b/src/media.py
+--- a/src/media.py
++++ b/src/media.py
+@@ -3,6 +3,7 @@
+ import math
+ import re
+ import struct
++import gc
+ from pathlib import Path
+ from fractions import Fraction
+ 
+@@ -27,7 +28,18 @@
+     return f"{hours:02}:{minutes:02}:{milliseconds / 1000:06.3f}"
+ 
+ 
+-def oriented_image(frame, *, region=None, reference_size=None):
++_metadata_bytes = 0
++
++
++def image_geometry(frame, region=None, reference_size=None):
++    global _metadata_bytes
++    # PyAV side_data retains its parent frame in a cycle. Collect before reading
++    # another metadata object once native buffers, invisible to GC, exceed 16MiB.
++    # Reachable reference frames (e.g. BoundaryBuffer) are preserved by GC.
++    if _metadata_bytes >= 16 * 1024**2:
++        gc.collect()
++        _metadata_bytes = 0
++    _metadata_bytes += frame.width * frame.height * 2
+     for side in frame.side_data:
+         if side.type.name != "DISPLAYMATRIX":
+             continue
+@@ -46,6 +58,20 @@
+     box = tuple(round(v * size) for v, size in zip(region, (width, height) * 2)) if region is not None else None
+     if box == (0, 0, width, height):
+         box = None
++    return angle, width, height, box
++
++
++def oriented_image(frame, *, region=None, reference_size=None, converter=None):
++    if frame.format.name == 'd3d11':
++        if converter is not None:
++            return converter.convert(frame, region=region, reference_size=reference_size)
++        from gpu_image import GPUImageConverter
++        gpu = GPUImageConverter()
++        try:
++            return gpu.convert(frame, region=region, reference_size=reference_size)
++        finally:
++            gpu.close()
++    angle, width, height, box = image_geometry(frame, region, reference_size)
+     if box is not None and not angle and frame.format.name == "yuv420p" and width % 32 == 0 and height % 2 == 0:
+         x0, y0, x1, y1 = box
+         if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:
+diff --git a/src/pipeline.py b/src/pipeline.py
+new file mode 100644
+--- /dev/null
++++ b/src/pipeline.py
+@@ -0,0 +1,51 @@
++"""Bounded, ordered prefetch with deterministic worker shutdown."""
++from queue import Queue, Empty, Full
++from threading import Event, Thread
++
++
++def prefetch(source, cancel, capacity=2):
++    queue, stopped = Queue(maxsize=capacity), Event()
++
++    def put(item):
++        while not stopped.is_set() and not cancel.is_set():
++            try:
++                queue.put(item, timeout=.05)
++                return
++            except Full:
++                pass
++
++    def produce():
++        try:
++            for item in source:
++                if stopped.is_set() or cancel.is_set():
++                    break
++                put((True, item))
++        except BaseException as error:
++            put((False, error))
++        finally:
++            close = getattr(source, 'close', None)
++            if close:
++                close()
++            put((False, None))
++
++    worker = Thread(target=produce, name='analysis-prefetch', daemon=True)
++    worker.start()
++    try:
++        while True:
++            from analysis_common import check_cancel
++            check_cancel(cancel)
++            try:
++                ok, item = queue.get(timeout=.05)
++            except Empty:
++                continue
++            if not ok:
++                if item is not None:
++                    raise item
++                return
++            yield item
++            del item
++    finally:
++        stopped.set()
++        worker.join()
++        while not queue.empty():
++            queue.get_nowait()
+diff --git a/src/preview.py b/src/preview.py
+--- a/src/preview.py
++++ b/src/preview.py
+@@ -4,9 +4,9 @@
+ import os
+ from pathlib import Path
+ 
+-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QUrl, Signal
++from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QUrl, Signal, QTimer
+ from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform
+-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
++from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QVideoFrame
+ from PySide6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QSlider, QProxyStyle, QStyle, QVBoxLayout, QWidget
+ 
+ 
+@@ -22,13 +22,31 @@
+         return super().styleHint(hint, option, widget, returnData)
+ 
+ 
++class _VideoOverlay(QWidget):
++    """Widget annotations above the GPU surface, without intercepting input."""
++
++    def __init__(self, canvas):
++        super().__init__(canvas)
++        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
++        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
++
++    def paintEvent(self, event):
++        self.parent().paint_canvas(QPainter(self), video=False)
++
++
+ class VideoCanvas(QWidget):
+     regionChanged = Signal(str, object)
+     editStarted = Signal()
+ 
+     def __init__(self, parent=None):
+         super().__init__(parent)
+-        self.image = QImage()
++        self._image = QImage()
++        self._frame = QVideoFrame()
++        self.image_size = QSize()
++        self.snapshot_count = 0
++        self.video_widget = None
++        self.video_sink = None
++        self.overlay = None
+         self.regions = {}
+         self.kind = ""
+         self.show_regions = True
+@@ -51,6 +69,68 @@
+         self.controls_hint.hide()
+         QApplication.instance().installEventFilter(self)
+ 
++    def enable_video(self):
++        """Use Qt's GPU renderer; keep headless/software execution available."""
++        if (os.environ.get("ARCADECLIP_PREVIEW_RENDERER") == "software"
++                or QApplication.platformName() in ("offscreen", "minimal")):
++            return
++        from PySide6.QtQuickWidgets import QQuickWidget
++        widget = QQuickWidget(self)
++        widget.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
++        widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
++        widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
++        widget.setSource(QUrl.fromLocalFile(str(Path(__file__).parent / "assets/preview.qml")))
++        if widget.status() == QQuickWidget.Status.Error:
++            import logging
++            logging.getLogger(__name__).warning("GPU preview unavailable: %s", widget.errors())
++            widget.deleteLater()
++            return
++        self.video_widget = widget
++        self.video_sink = widget.rootObject().property("videoSink")
++        self.overlay = _VideoOverlay(self)
++        widget.setGeometry(self.rect())
++        self.overlay.setGeometry(self.rect())
++        widget.show()
++        self.overlay.show()
++        self.controls_hint.raise_()
++
++    @property
++    def image(self):
++        """Materialize a CPU snapshot only when a consumer actually needs pixels."""
++        if self._image.isNull() and self._frame.isValid():
++            image = self._frame.toImage()
++            image = image.transformed(QTransform().rotate(self._frame.rotation().value))
++            if self._frame.mirrored():
++                image = image.mirrored(True, False)
++            self._image = image
++            self.snapshot_count += 1
++        return self._image
++
++    def set_frame(self, frame):
++        previous_size = self.image_size
++        self._frame = QVideoFrame(frame)
++        self._image = QImage()
++        size = frame.surfaceFormat().viewport().size()
++        if size.isEmpty():
++            size = frame.size()
++        rotation = frame.surfaceFormat().rotation().value + frame.rotation().value
++        self.image_size = size.transposed() if rotation % 180 else size
++        # VideoOutput schedules its own GPU rendering. Static annotations do not
++        # need a QWidget repaint for each decoded frame.
++        if self.video_widget is None or self.image_size != previous_size:
++            self.update()
++
++    def update(self, *args):
++        if self.video_widget is not None:
++            rect = self.video_rect()
++            root = self.video_widget.rootObject()
++            for key, value in (("videoX", rect.x()), ("videoY", rect.y()),
++                               ("videoWidth", rect.width()), ("videoHeight", rect.height())):
++                if root.property(key) != value:
++                    root.setProperty(key, value)
++            self.overlay.update()
++        super().update(*args)
++
+     def release(self):
+         """Stop watching the application's events.
+ 
+@@ -58,6 +138,7 @@
+         widget and everything it owns alive for the rest of the run.
+         """
+         QApplication.instance().removeEventFilter(self)
++        self.set_image(QImage())
+ 
+     def closeEvent(self, event):
+         self.release()
+@@ -84,15 +165,19 @@
+         super().enterEvent(event)
+ 
+     def resizeEvent(self, event):
++        if self.video_widget is not None:
++            self.video_widget.setGeometry(self.rect())
++            self.overlay.setGeometry(self.rect())
++            self.update()
+         self.controls_hint.setFixedWidth(max(1, self.width()-28))
+         self.controls_hint.adjustSize()
+         self.controls_hint.move(14, max(0, self.height()-self.controls_hint.height()-12))
+         super().resizeEvent(event)
+ 
+     def video_rect(self):
+-        if self.image.isNull():
++        if self.image_size.isEmpty():
+             return QRectF()
+-        size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
++        size = self.image_size.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+         width, height = size.width() * self.zoom_scale, size.height() * self.zoom_scale
+         return QRectF((self.width() - width) / 2 + self.pan.x(),
+                       (self.height() - height) / 2 + self.pan.y(), width, height)
+@@ -105,7 +190,7 @@
+         self.update()
+ 
+     def zoom(self, factor, anchor=None):
+-        if self.image.isNull():
++        if self.image_size.isEmpty():
+             return
+         anchor = anchor or QPointF(self.rect().center())
+         point = self.normalized_point(anchor)
+@@ -141,7 +226,11 @@
+                        max(0., min(1., (point.y() - rect.y()) / rect.height())))
+ 
+     def set_image(self, image):
+-        self.image = image
++        self._frame = QVideoFrame()
++        self._image = image
++        self.image_size = image.size()
++        if self.video_sink is not None:
++            self.video_sink.setVideoFrame(QVideoFrame(image) if not image.isNull() else QVideoFrame())
+         self.update()
+ 
+     def set_regions(self, regions):
+@@ -158,14 +247,19 @@
+         self.update()
+ 
+     def paintEvent(self, event):
+-        painter = QPainter(self)
+-        painter.fillRect(self.rect(), QColor("#10141b"))
++        if self.video_widget is None:
++            self.paint_canvas(QPainter(self), video=True)
++
++    def paint_canvas(self, painter, *, video):
++        if video:
++            painter.fillRect(self.rect(), QColor("#10141b"))
+         rect = self.video_rect()
+         if rect.isEmpty():
+             painter.setPen(QColor("#adb7c5"))
+             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, tr('영상을 선택하세요'))
+             return
+-        painter.drawImage(rect, self.image)
++        if video:
++            painter.drawImage(rect, self.image)
+         if not self.show_regions:
+             return
+         def draw_label(point, text):
+@@ -251,8 +345,8 @@
+         self._end = self.normalized_point(event.position())
+         box = self._drag_box()
+         self._start = self._end = None
+-        if ((box[2] - box[0]) * self.image.width() >= 2
+-                and (box[3] - box[1]) * self.image.height() >= 2):
++        if ((box[2] - box[0]) * self.image_size.width() >= 2
++                and (box[3] - box[1]) * self.image_size.height() >= 2):
+             self.regions[self.kind] = box
+             self.regionChanged.emit(self.kind, box[:])
+         self.update()
+@@ -270,10 +364,17 @@
+         self.player.setAudioOutput(self.audio)
+         self.audio.setVolume(.7)
+         self.canvas = VideoCanvas(self)
++        self.canvas.enable_video()
+         self.frame_time = None
+         self._generation = 0
+         self._exact_frame = False
+         self.sink = None
++        self._frame_slot = None
++        self._pending_seek = None
++        self.seek_timer = QTimer(self)
++        self.seek_timer.setSingleShot(True)
++        self.seek_timer.setInterval(40)
++        self.seek_timer.timeout.connect(self.flush_seek)
+         self.play_button = QPushButton(tr('재생'))
+         self.play_button.setFixedWidth(90)
+         self.play_button.clicked.connect(self.toggle_playback)
+@@ -335,19 +436,30 @@
+         self.canvas.update()
+ 
+     def release(self):
+-        """Let go of the application-wide filter its canvas installed."""
++        """Detach native playback before Qt destroys its rendering surface."""
++        self.clear()
+         self.canvas.release()
++
++    def closeEvent(self, event):
++        self.release()
++        super().closeEvent(event)
+ 
+     def clear(self):
+         self._generation += 1
++        self.seek_timer.stop()
++        self._pending_seek = None
+         # Stop before detaching: FFmpeg renderer destruction can otherwise wait for
+         # the Python GIL while stop() waits for that renderer (Windows/PySide6).
+         self.player.stop()
+         self.player.setVideoSink(None)
+         self.player.setSource(QUrl())
+         if self.sink is not None:
+-            self.sink.deleteLater()
++            if self._frame_slot is not None:
++                self.sink.videoFrameChanged.disconnect(self._frame_slot)
++            if self.sink is not self.canvas.video_sink:
++                self.sink.deleteLater()
+             self.sink = None
++            self._frame_slot = None
+         self.frame_time = None
+         self._exact_frame = False
+         self.canvas._start = self.canvas._end = None
+@@ -360,8 +472,9 @@
+     def load(self, path: Path):
+         self.clear()
+         generation = self._generation
+-        self.sink = QVideoSink(self)
+-        self.sink.videoFrameChanged.connect(lambda frame: self._receive_frame(frame, generation))
++        self.sink = self.canvas.video_sink or QVideoSink(self)
++        self._frame_slot = lambda frame: self._receive_frame(frame, generation)
++        self.sink.videoFrameChanged.connect(self._frame_slot)
+         self.player.setSource(QUrl.fromLocalFile(os.path.abspath(os.path.expanduser(path))))
+         self.player.setVideoSink(self.sink)
+         self.player.pause()
+@@ -369,14 +482,7 @@
+     def _receive_frame(self, frame, generation):
+         if generation != self._generation or self._exact_frame or not frame.isValid():
+             return
+-        image = frame.toImage()
+-        if image.isNull():
+-            return
+-        # toImage applies surface transforms; presentation transforms are separate.
+-        image = image.transformed(QTransform().rotate(frame.rotation().value))
+-        if frame.mirrored():
+-            image = image.mirrored(True, False)
+-        self.canvas.set_image(image)
++        self.canvas.set_frame(frame)
+         self.frame_time = frame.startTime() / 1_000_000 if frame.startTime() >= 0 else None
+         self.frameChanged.emit()
+ 
+@@ -390,11 +496,27 @@
+     def _seek_slider(self, action):
+         seconds = self.slider.sliderPosition() / 1000
+         self.seekStarted.emit()
+-        self.seek(seconds)
++        self.request_seek(seconds)
++
++    def request_seek(self, seconds):
++        """Coalesce scrubbing input, retaining only the latest requested target."""
++        if not math.isfinite(seconds):
++            return
++        if self.seek_timer.isActive():
++            self._pending_seek = seconds
++        else:
++            self.seek(seconds)
++            self.seek_timer.start()
++
++    def flush_seek(self):
++        if self._pending_seek is not None:
++            self.seek(self._pending_seek)
+ 
+     def seek(self, seconds):
+         if not math.isfinite(seconds):
+             return
++        self.seek_timer.stop()
++        self._pending_seek = None
+         self._exact_frame = False
+         self.player.setPosition(max(0, min(self.player.duration(), round(seconds * 1000))))
+ 
+diff --git a/src/profile_panel.py b/src/profile_panel.py
+--- a/src/profile_panel.py
++++ b/src/profile_panel.py
+@@ -6,7 +6,7 @@
+ import json
+ import zipfile
+ 
+-from PySide6.QtCore import Qt, Signal, QUrl, QVariantAnimation, QEasingCurve
++from PySide6.QtCore import Qt, Signal, QUrl, QVariantAnimation, QEasingCurve, QTimer
+ from PySide6.QtGui import QPixmap, QIcon
+ from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+ from preview import VideoCanvas
+@@ -78,6 +78,7 @@
+         self.guide_prompt.setStyleSheet("background:#18232b;color:white;border-radius:6px;font-size:15px;padding:12px;")
+         layout.addWidget(self.guide_prompt)
+         self.guide_video = VideoCanvas()
++        self.guide_video.enable_video()
+         self.guide_video.setEnabled(False)
+         self.guide_video.setMinimumSize(240, 135)
+         self.guide_video.setMaximumHeight(200)
+@@ -86,9 +87,9 @@
+         self.guide_pause.clicked.connect(self.toggle_guide)
+         layout.addWidget(self.guide_pause)
+         self.guide_player = QMediaPlayer(self)
+-        self.guide_sink = QVideoSink(self)
++        self.guide_sink = self.guide_video.video_sink or QVideoSink(self)
+         self.guide_sink.videoFrameChanged.connect(
+-            lambda frame: self.guide_video.set_image(frame.toImage()) if frame.isValid() else None)
++            lambda frame: self.guide_video.set_frame(frame) if frame.isValid() else None)
+         self.guide_player.setVideoSink(self.guide_sink)
+         self.guide_player.setLoops(QMediaPlayer.Loops.Infinite)
+         self.guide_player.errorOccurred.connect(lambda error, text: self.guide_title.setText(tr('가이드 재생 오류: ') + text))
+@@ -110,7 +111,12 @@
+                 row.addWidget(button)
+             layout.addLayout(row)
+         self.preview.regionChanged.connect(self.region_edited)
+-        self.preview.frameChanged.connect(self.update_crop)
++        self.crop_timer = QTimer(self)
++        self.crop_timer.setSingleShot(True)
++        self.crop_timer.setInterval(150)
++        self.crop_timer.timeout.connect(self.update_crop)
++        self.preview.frameChanged.connect(self.schedule_crop)
++        self.preview.player.playbackStateChanged.connect(self.crop_playback_changed)
+         self.update_crop()
+ 
+     def update_guide(self):
+@@ -147,25 +153,47 @@
+         super().showEvent(event)
+         self.refresh_profiles()
+         self.update_guide()
++        self.update_crop()
+ 
+     def hideEvent(self, event):
++        self.crop_timer.stop()
+         self.guide_player.stop()
+         self.kind_pulse.stop()
+         self.kind.setStyleSheet("")
+         super().hideEvent(event)
+ 
++    def release(self):
++        self.crop_timer.stop()
++        self.guide_player.stop()
++        self.guide_player.setVideoSink(None)
++        self.guide_player.setSource(QUrl())
++        self.guide_video.release()
++
+     def change_region(self):
+         self.update_guide()
+         self.preview.set_region_kind(self.kind.currentData())
+         self.update_crop()
+ 
+     def region_edited(self, *args):
+-        image = self.preview.canvas.image
+-        if not image.isNull():
+-            self.profile_size = [image.width(), image.height()]
+-        self.update_crop()
++        size = self.preview.canvas.image_size
++        if not size.isEmpty():
++            self.profile_size = [size.width(), size.height()]
++        self.update_crop()
++
++    def schedule_crop(self):
++        if not self.isVisible():
++            return
++        if not self.preview.player.isPlaying():
++            self.update_crop()
++        elif not self.crop_timer.isActive():
++            self.crop_timer.start()
++
++    def crop_playback_changed(self, state):
++        if state != QMediaPlayer.PlaybackState.PlayingState:
++            self.update_crop()
+ 
+     def update_crop(self):
++        self.crop_timer.stop()
+         offset = self.jacket_offset
+         roi = self.preview.regions.get("jacket")
+         self.preview.canvas.offset_box = None
+@@ -175,11 +203,11 @@
+             self.preview.canvas.offset_box = [x0 + a * (x1-x0), y0 + b * (y1-y0),
+                                               x0 + c * (x1-x0), y0 + d * (y1-y0)]
+         self.preview.canvas.update()
+-        image = self.preview.canvas.image
+-        if image.isNull():
++        dimensions = self.preview.canvas.image_size
++        if dimensions.isEmpty():
+             self.crop.clear()
+             return
+-        size = [image.width(), image.height()]
++        size = [dimensions.width(), dimensions.height()]
+         if self.profile_size and abs(size[0] / size[1] - self.profile_size[0] / self.profile_size[1]) > .01:
+             self.preview.set_regions({})
+             self.profile_size = None
+@@ -188,6 +216,9 @@
+         if not box:
+             self.crop.clear()
+             return
++        if not self.isVisible():
++            return
++        image = self.preview.canvas.image
+         x0, y0, x1, y1 = box
+         cropped = image.copy(round(x0 * size[0]), round(y0 * size[1]),
+                              round((x1 - x0) * size[0]), round((y1 - y0) * size[1]))
+@@ -205,15 +236,15 @@
+ 
+     def edit_coordinates(self):
+         key = self.kind.currentData()
+-        image = self.preview.canvas.image
+-        if not key or image.isNull():
++        size = self.preview.canvas.image_size
++        if not key or size.isEmpty():
+             return
+         self.preview.player.pause()
+         dialog = QDialog(self)
+         dialog.setWindowTitle(tr('{region} 영역 좌표', region=REGIONS[key]))
+         layout = QFormLayout(dialog)
+         box = self.preview.regions.get(key, [0, 0, 1, 1])
+-        dimensions = [image.width(), image.height()] * 2
++        dimensions = [size.width(), size.height()] * 2
+         fields = []
+         for label, value, maximum in zip((tr('왼쪽'), tr('위'), tr('오른쪽'), tr('아래')), box, dimensions):
+             field = QSpinBox()
+@@ -240,8 +271,8 @@
+     def current_profile(self, require_complete=False):
+         if require_complete:
+             require_regions(self.preview.regions)
+-        image = self.preview.canvas.image
+-        size = self.profile_size if image.isNull() else [image.width(), image.height()]
++        dimensions = self.preview.canvas.image_size
++        size = self.profile_size if dimensions.isEmpty() else [dimensions.width(), dimensions.height()]
+         return validate_profile({**({"jacket_offset": self.jacket_offset} if self.jacket_offset else {}),
+                                  "version": 1, "name": self.name.text(),
+                                  "size": size, "regions": self.preview.regions,
+diff --git a/src/recognition.py b/src/recognition.py
+--- a/src/recognition.py
++++ b/src/recognition.py
+@@ -17,7 +17,8 @@
+ 
+ 
+ def analyze(path, start, end, profile, directory, cancel, report, *, workers=0,
+-            decoder_threads=0, ocr_workers=0, gpu=False, recognizer=None):
++            decoder_threads=0, ocr_workers=0, gpu=False, recognizer=None,
++            gpu_convert=None, pipelined=False):
+     if recognizer is None:
+         import jacket_recognition as recognizer
+     profile = validate_profile(profile)
+@@ -29,8 +30,13 @@
+     try:
+         check_cancel(cancel)
+         end = clamp_analysis_end(path, start, end)
++        extra = {}
++        if gpu_convert is not None:
++            extra['gpu_convert'] = gpu_convert
++        if pipelined:
++            extra['pipelined'] = True
+         detected = recognizer.detect(path, start, end, profile, directory, cancel, report,
+-                                     workers=workers, decoder_threads=decoder_threads, gpu=gpu)
++                                     workers=workers, decoder_threads=decoder_threads, gpu=gpu, **extra)
+         profile = validate_profile(detected.get("profile", profile))
+         result.update(profile=profile, warnings=list(detected.get("warnings", [])))
+         if "scan_metrics" in detected:
+diff --git a/src/tests/test_app.py b/src/tests/test_app.py
+--- a/src/tests/test_app.py
++++ b/src/tests/test_app.py
+@@ -23,6 +23,28 @@
+ 
+ 
+ class AppTests(unittest.TestCase):
++    def test_analysis_options_stay_on_stage_three_after_settings(self):
++        from PySide6.QtCore import QSettings
++        from advanced_settings import show_advanced
++        keys = ['analysis/' + name for name in ('gpu_decode', 'gpu_convert', 'analysis_pipeline')]
++        with tempfile.TemporaryDirectory() as name:
++            settings = QSettings(str(Path(name) / 'settings.ini'), QSettings.Format.IniFormat)
++            with patch.object(MainWindow, 'refresh_catalog_summary'), \
++                    patch('workspace_ui.QSettings', return_value=settings), \
++                    patch('advanced_settings.QSettings', return_value=settings):
++                window = MainWindow(Path(name))
++                controls = [window.gpu_decode, window.gpu_convert, window.analysis_pipeline]
++                parents = [control.parent() for control in controls]
++                for control in controls:
++                    self.assertIn(control, window.busy_controls)
++                    control.setChecked(False)
++                    control.setChecked(True)
++                show_advanced(window)
++                self.assertEqual(parents, [control.parent() for control in controls])
++                for key in keys:
++                    self.assertTrue(settings.value(key, type=bool))
++                window.advanced.close()
++
+     @classmethod
+     def setUpClass(cls):
+         cls.application = QApplication.instance() or QApplication([])
+@@ -1024,8 +1046,10 @@
+                 play.assert_not_called()
+                 with patch.object(window.preview.player, "isPlaying", return_value=True), patch.object(window.preview.player, "position", return_value=5000), patch.object(window, "step_frame") as frame:
+                     QTest.keyClick(window.preview.canvas, Qt.Key.Key_Right)
++                    window.preview.flush_seek()
+                     seek.assert_called_with(6)
+                     QTest.keyClick(window.preview.canvas, Qt.Key.Key_Left)
++                    window.preview.flush_seek()
+                     seek.assert_called_with(4)
+                     frame.assert_not_called()
+                 with patch.object(window.preview.player, "isPlaying", return_value=False), patch.object(window, "step_frame") as frame:
+diff --git a/src/tests/test_gpu_image.py b/src/tests/test_gpu_image.py
+new file mode 100644
+--- /dev/null
++++ b/src/tests/test_gpu_image.py
+@@ -0,0 +1,104 @@
++"""Native D3D11 tests; opt in on an x64 Windows machine with video hardware."""
++import os
++import gc
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++
++import av
++import numpy as np
++from PIL import Image
++from media import frame_at
++from video_sampling import samples
++from gpu_image import GPUImageConverter
++
++
++@unittest.skipUnless(os.environ.get('ARCADECLIP_TEST_GPU') == '1', 'Native GPU test opt-in')
++class GPUImageTests(unittest.TestCase):
++    def test_independent_options_and_pipeline_preserve_pixels_and_timestamps(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'options.mp4'
++            self.video(path, 90)
++            box = [.103, .137, .803, .837]
++            expected = list(samples(path, 0, 2, .5, threading.Event(), region=box))
++            for decode in (False, True):
++                for convert in (False, True):
++                    for pipeline in (False, True):
++                        with self.subTest(decode=decode, convert=convert, pipeline=pipeline):
++                            metrics = dict(decode_s=0., convert_s=0., decoded_frames=0, sample_frames=0)
++                            actual = list(samples(path, 0, 2, .5, threading.Event(), region=box,
++                                          gpu=decode, gpu_convert=convert, pipelined=pipeline, metrics=metrics))
++                            self.assertEqual([t for t, _ in expected], [t for t, _ in actual])
++                            self.assertEqual(metrics['sample_frames'], 4)
++                            self.assertEqual(metrics['converter'].startswith('GPU'), convert)
++                            for (_, left), (_, right) in zip(expected, actual):
++                                self.assertEqual(left.size, right.size)
++                                self.assertLess(np.abs(np.asarray(left).astype(float)-np.asarray(right)).mean(), 5)
++
++    def video(self, path, rotation=0, mirror=False):
++        image = Image.new('RGB', (320, 192), 'red')
++        image.paste('blue', (160, 0, 320, 96))
++        image.paste('green', (0, 96, 160, 192))
++        image.paste('white', (160, 96, 320, 192))
++        with av.open(str(path), 'w') as container:
++            stream = container.add_stream('libx264', rate=30)
++            stream.width, stream.height, stream.pix_fmt = 320, 192, 'yuv420p'
++            stream.set_display_rotation(rotation, hflip=mirror)
++            for _ in range(60):
++                for packet in stream.encode(av.VideoFrame.from_image(image)):
++                    container.mux(packet)
++            for packet in stream.encode():
++                container.mux(packet)
++
++    def test_gpu_crop_rotation_matches_cpu_and_selection_is_sparse(self):
++        with tempfile.TemporaryDirectory() as directory:
++            for angle in (0, 90, 180, 270):
++                path = Path(directory) / f'{angle}.mp4'
++                self.video(path, angle)
++                box = [.103, .137, .803, .837]
++                expected = frame_at(path, 0, region=box)['image']
++                metrics = dict(decode_s=0., convert_s=0., decoded_frames=0, sample_frames=0)
++                count = 0
++                original = GPUImageConverter.convert
++                def convert(instance, *args, **kwargs):
++                    nonlocal count
++                    count += 1
++                    return original(instance, *args, **kwargs)
++                with patch.object(GPUImageConverter, 'convert', convert):
++                    rows = list(samples(path, 0, 2, 1, threading.Event(), gpu=True,
++                                        region=box, metrics=metrics))
++                self.assertEqual(count, 2)
++                self.assertEqual(metrics['sample_frames'], 2)
++                self.assertGreater(metrics['decoded_frames'], 50)
++                for _, actual in rows:
++                    self.assertEqual(actual.size, expected.size)
++                    difference = np.abs(np.asarray(actual).astype(float)-np.asarray(expected))
++                    self.assertLess(difference.mean(), 5)
++
++    def test_cancel_closes_native_converter_and_preserves_live_reference(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'cancel.mp4'
++            self.video(path)
++            cancel = threading.Event()
++            retained = []
++            iterator = samples(path, 0, 2, 1, cancel, gpu=True,
++                               on_frame=lambda seconds, frame: retained.append(frame) if not retained else None)
++            first = next(iterator)[1]
++            cancel.set()
++            from concurrent.futures import CancelledError
++            with self.assertRaises(CancelledError):
++                next(iterator)
++            gc.collect()
++            self.assertEqual(retained[0].width, 320)
++            self.assertEqual(first.size, (320, 192))
++            retained.clear()
++            gc.collect()
++
++    def test_unsupported_mirror_is_rejected(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'mirror.mp4'
++            self.video(path, mirror=True)
++            with self.assertRaises(ValueError):
++                list(samples(path, 0, 2, 1, threading.Event(), gpu=True))
+diff --git a/src/tests/test_pipeline.py b/src/tests/test_pipeline.py
+new file mode 100644
+--- /dev/null
++++ b/src/tests/test_pipeline.py
+@@ -0,0 +1,40 @@
++import threading
++import unittest
++from concurrent.futures import CancelledError
++from pipeline import prefetch
++
++
++class PipelineTests(unittest.TestCase):
++    def test_order_and_producer_error(self):
++        def source():
++            yield 1
++            yield 2
++            raise ValueError('producer failed')
++        iterator = prefetch(source(), threading.Event())
++        self.assertEqual(next(iterator), 1)
++        self.assertEqual(next(iterator), 2)
++        with self.assertRaisesRegex(ValueError, 'producer failed'):
++            next(iterator)
++
++    def test_close_and_cancel_release_bounded_producer(self):
++        for cancel_run in (False, True):
++            cancel, closed = threading.Event(), threading.Event()
++            produced = []
++            def source():
++                try:
++                    for number in range(10000):
++                        produced.append(number)
++                        yield number
++                finally:
++                    closed.set()
++            iterator = prefetch(source(), cancel, capacity=2)
++            next(iterator)
++            if cancel_run:
++                cancel.set()
++                with self.assertRaises(CancelledError):
++                    next(iterator)
++            else:
++                iterator.close()
++            self.assertTrue(closed.is_set())
++            self.assertLessEqual(len(produced), 5)
++            self.assertFalse(any(t.name == 'analysis-prefetch' for t in threading.enumerate()))
+diff --git a/src/tests/test_preview.py b/src/tests/test_preview.py
+--- a/src/tests/test_preview.py
++++ b/src/tests/test_preview.py
+@@ -5,6 +5,7 @@
+ import sys
+ import tempfile
+ import unittest
++from unittest.mock import patch
+ 
+ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ 
+@@ -157,6 +158,71 @@
+         self.assertTrue(preview.player.source().isEmpty())
+         preview.close()
+ 
++    def test_frame_metadata_and_coordinates_do_not_extract_pixels(self):
++        canvas = VideoCanvas()
++        canvas.resize(400, 400)
++        frame = QVideoFrame(QImage(400, 200, QImage.Format.Format_RGB32))
++        frame.setRotation(QtVideo.Rotation.Clockwise90)
++        for _ in range(20):
++            canvas.set_frame(frame)
++            canvas.video_rect()
++            canvas.zoom(1.01, QPointF(200, 200))
++        self.assertEqual(canvas.image_size.width(), 200)
++        self.assertEqual(canvas.snapshot_count, 0)
++        self.assertEqual(canvas.image.width(), 200)
++        self.assertEqual(canvas.image.width(), 200)
++        self.assertEqual(canvas.snapshot_count, 1)
++        canvas.set_frame(frame)
++        self.assertEqual(canvas.image.width(), 200)
++        self.assertEqual(canvas.snapshot_count, 2)
++        canvas.close()
++
++    def test_scrubbing_coalesces_and_direct_seek_cancels_pending_target(self):
++        preview = Preview()
++        with patch.object(preview.player, 'duration', return_value=100000), patch.object(preview.player, 'setPosition') as move:
++            for seconds in range(1, 20):
++                preview.request_seek(seconds)
++            self.assertEqual(move.call_count, 1)
++            preview.flush_seek()
++            self.assertEqual(move.call_count, 2)
++            move.assert_called_with(19000)
++            preview.request_seek(20)
++            preview.request_seek(21)
++            preview.seek(30)
++            preview.flush_seek()
++            move.assert_called_with(30000)
++        preview.clear()
++        preview.close()
++
++    def test_hidden_profile_never_extracts_crop_pixels(self):
++        from profile_panel import ProfilePanel
++        preview = Preview()
++        panel = ProfilePanel(preview)
++        panel.name.setText('snapshot test')
++        panel.kind.setCurrentIndex(panel.kind.findData('jacket'))
++        preview.set_regions({'jacket': [.1, .1, .9, .9]})
++        frame = QVideoFrame(QImage(400, 200, QImage.Format.Format_RGB32))
++        preview._receive_frame(frame, 0)
++        panel.update_crop()
++        panel.current_profile()
++        self.assertEqual(preview.canvas.snapshot_count, 0)
++        panel.show()
++        self.app.processEvents()
++        panel.guide_player.stop()
++        self.assertEqual(preview.canvas.snapshot_count, 1)
++        with patch.object(preview.player, 'isPlaying', return_value=True):
++            for _ in range(20):
++                preview._receive_frame(frame, 0)
++            self.assertEqual(preview.canvas.snapshot_count, 1)
++            panel.update_crop()
++            self.assertEqual(preview.canvas.snapshot_count, 2)
++        panel.hide()
++        preview._receive_frame(frame, 0)
++        self.assertEqual(preview.canvas.snapshot_count, 2)
++        panel.guide_video.release()
++        panel.close()
++        preview.close()
++
+     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required")
+     def test_switch_while_playing_audio_video_does_not_deadlock(self):
+         # Use a subprocess: a GIL/native renderer deadlock also blocks Qt timers.
+@@ -193,6 +259,7 @@
+ preview.load(sys.argv[1])
+ app.exec()
+ """
++        script = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n" + script
+         with tempfile.TemporaryDirectory() as directory:
+             a, b = Path(directory) / "a.mp4", Path(directory) / "b.mp4"
+             subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+diff --git a/src/tests/test_recognition.py b/src/tests/test_recognition.py
+--- a/src/tests/test_recognition.py
++++ b/src/tests/test_recognition.py
+@@ -323,6 +323,13 @@
+         self.assertEqual(events[-1]["done"], events[-1]["total"])
+         parallel = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None, workers=2)
+         self.assertEqual(parallel["clips"], result["clips"])
++        overlapped = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None,
++                             workers=2, pipelined=True, gpu_convert=False)
++        self.assertEqual(overlapped['clips'], result['clips'])
++        preserved = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None,
++                           workers=1, pipelined=True, gpu_convert=False)
++        self.assertEqual(preserved['clips'], result['clips'])
++        self.assertFalse(preserved['scan_metrics']['pipelined'])
+         for left, right in zip(result["clips"], result["clips"][1:]):
+             self.assertEqual(left["end"], right["start"])
+ 
+diff --git a/src/video_sampling.py b/src/video_sampling.py
+--- a/src/video_sampling.py
++++ b/src/video_sampling.py
+@@ -2,6 +2,8 @@
+ from i18n import tr
+ from concurrent.futures import CancelledError
+ from time import perf_counter
++from contextlib import ExitStack
++import gc
+ import av
+ from media import oriented_image
+ from analysis_common import check_cancel
+@@ -24,12 +26,32 @@
+ 
+ 
+ def samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=None, gpu=False,
+-            region=None, reference_size=None, on_frame=None):
++            region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
++    try:
++        yield from _samples(path, start, end, interval, cancel, decoder_threads=decoder_threads,
++                            metrics=metrics, gpu=gpu, region=region,
++                            reference_size=reference_size, on_frame=on_frame,
++                            gpu_convert=gpu_convert, pipelined=pipelined)
++    finally:
++        # After generator frames unwind, reclaim metadata cycles. Live frames
++        # deliberately retained by a reference consumer remain reachable.
++        gc.collect()
++
++
++def _samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=None, gpu=False,
++             region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
++    gpu_convert = gpu if gpu_convert is None else gpu_convert
+     hardware = None
+     if gpu:
+         from av.codec.hwaccel import HWAccel
+-        hardware = HWAccel("d3d11va", allow_software_fallback=False)
+-    with av.open(str(path), **({"hwaccel": hardware} if hardware else {})) as container:
++        hardware = HWAccel("d3d11va", allow_software_fallback=False, is_hw_owned=True)
++    with ExitStack() as resources:
++        converter = None
++        if gpu_convert:
++            from gpu_image import GPUImageConverter
++            converter = GPUImageConverter()
++            resources.callback(converter.close)
++        container = resources.enter_context(av.open(str(path), **({"hwaccel": hardware} if hardware else {})))
+         if not container.streams.video:
+             raise ValueError(tr('영상 스트림을 찾을 수 없습니다.'))
+         stream = container.streams.video[0]
+@@ -42,6 +64,29 @@
+         if start >= end:
+             return
+         container.seek(origin + int(start / stream.time_base), stream=stream, backward=True)
++        selected = _selected(container, stream, origin, start, end, interval, cancel, metrics, on_frame)
++        if pipelined:
++            from pipeline import prefetch
++            selected = prefetch(selected, cancel, capacity=2)
++        resources.callback(selected.close)
++        for seconds, frame in selected:
++            began = perf_counter()
++            if converter:
++                image = converter.convert(frame, region=region, reference_size=reference_size)
++            else:
++                if frame.format.name == 'd3d11':
++                    frame = frame.reformat(format='nv12')
++                image = oriented_image(frame, region=region, reference_size=reference_size)
++            if metrics is not None:
++                metrics['convert_s'] += perf_counter() - began
++                metrics['sample_frames'] += 1
++                metrics['converter'] = 'GPU · D3D11 ROI→RGB' if converter else 'CPU'
++            frame = None
++            yield seconds, image
++            del image
++
++
++def _selected(container, stream, origin, start, end, interval, cancel, metrics, on_frame):
+         target = start
+         iterator = iter(container.decode(stream))
+         while True:
+@@ -58,6 +103,7 @@
+             if metrics is not None:
+                 metrics["decoder"] = "GPU · D3D11VA" if stream.codec_context.is_hwaccel else "CPU"
+             if frame.pts is None:
++                frame = None
+                 continue
+             seconds = float((frame.pts - origin) * stream.time_base)
+             if seconds >= end:
+@@ -65,24 +111,22 @@
+             if on_frame is not None:
+                 on_frame(seconds, frame)
+             if seconds + 1e-7 < target:
++                frame = None
+                 continue
+-            began = perf_counter()
+-            image = oriented_image(frame, region=region, reference_size=reference_size)
+-            if metrics is not None:
+-                metrics["convert_s"] += perf_counter() - began
+-                metrics["sample_frames"] += 1
+-            yield seconds, image
++            yield seconds, frame
++            frame = None
+             target = seconds + interval
+ 
+ 
+ def analysis_samples(path, start, end, interval, cancel, threads, metrics, gpu, report, warnings,
+-                     *, region=None, reference_size=None, on_frame=None):
++                     *, region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
+     # Resume at the next sampling target if the experimental decoder fails mid-stream.
+     resume = start
+-    if gpu:
++    if gpu or gpu_convert:
+         try:
+             for seconds, image in samples(path, start, end, interval, cancel,
+-                                          decoder_threads=threads, metrics=metrics, gpu=True,
++                                          decoder_threads=threads, metrics=metrics, gpu=gpu,
++                                          gpu_convert=gpu_convert, pipelined=pipelined,
+                                           region=region, reference_size=reference_size, on_frame=on_frame):
+                 resume = seconds + interval
+                 yield seconds, image
+@@ -90,8 +134,8 @@
+         except CancelledError:
+             raise
+         except (av.FFmpegError, RuntimeError, ValueError, NotImplementedError) as error:
+-            message = tr('GPU 디코딩을 사용할 수 없어 CPU로 계속합니다: {error}', error=error)
++            message = tr('GPU 처리를 사용할 수 없어 CPU로 계속합니다: {error}', error=error)
+             warnings.append(message)
+             report(message)
+     yield from samples(path, resume, end, interval, cancel, decoder_threads=threads, metrics=metrics,
+-                       region=region, reference_size=reference_size, on_frame=on_frame)
++                       region=region, reference_size=reference_size, on_frame=on_frame, pipelined=pipelined)
+diff --git a/src/workspace_ui.py b/src/workspace_ui.py
+--- a/src/workspace_ui.py
++++ b/src/workspace_ui.py
+@@ -261,6 +261,20 @@
+     w.analysis_range_summary = QLabel()
+     w.analysis_range_summary.setWordWrap(True)
+     body.addWidget(w.analysis_range_summary)
++    settings = QSettings('ArcadeClip', 'ArcadeClip')
++    for name, title, default, hint in (
++        ('gpu_decode', tr('GPU 영상 디코딩'), False, tr('실험용 D3D11VA 디코딩. 지원하지 않으면 CPU로 복귀합니다.')),
++        ('gpu_convert', tr('GPU 이미지 변환'), False, tr('선택된 프레임의 영역·색상 변환에 GPU를 사용합니다.')),
++        ('analysis_pipeline', tr('디코딩·변환·판독 겹쳐 처리'), True,
++         tr('대기 프레임 수를 제한합니다. 기존 CPU 경계 버퍼 사용 시 순차 처리합니다.'))):
++        control = QCheckBox(title)
++        control.setObjectName(name)
++        control.setToolTip(hint)
++        control.setChecked(settings.value('analysis/' + name, default, type=bool))
++        control.toggled.connect(lambda checked, key=name: settings.setValue('analysis/' + key, checked))
++        setattr(w, name, control)
++        body.addWidget(control)
++        w.busy_controls.append(control)
+     w.button(tr('현재 화면 인식 확인'), w.recognize_frame, body)
+     w.button(tr('이 구간에서 곡 찾기 →'), w.analyze_range, body).setProperty("primary", True)
+     body = page(tr('현재 클립'))
+@@ -353,9 +367,6 @@
+     w.ocr_workers.setRange(0, 32)
+     w.ocr_workers.setSpecialValueText(tr('자동 · CPU 수에 맞춤'))
+     w.ocr_workers.hide()
+-    w.gpu_decode = QCheckBox(tr('실험용 GPU 영상 디코딩 (D3D11VA)'), w)
+-    w.gpu_decode.setToolTip(tr('곡 탐색 영상 디코딩만 GPU 사용. 지원하지 않으면 CPU로 복귀합니다. OCR은 CPU 병렬 처리합니다.'))
+-    w.gpu_decode.hide()
+     w.encoder_crf = QSpinBox(w)
+     w.encoder_crf.setRange(0, 51)
+     w.encoder_crf.setValue(18)

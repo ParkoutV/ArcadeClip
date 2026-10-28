@@ -1,10 +1,12 @@
 """Settings view; values are applied only through its owning window."""
 from i18n import tr
 import os
-from PySide6.QtCore import QSettings, QUrl
+from pathlib import Path
+import sys
+from PySide6.QtCore import QProcess, QSettings, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QComboBox, QDialog, QVBoxLayout, QGroupBox, QFormLayout, QLineEdit,
-                               QHBoxLayout, QLabel, QDialogButtonBox, QMessageBox, QTabWidget, QWidget)
+                               QHBoxLayout, QLabel, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QTabWidget, QWidget)
 
 
 def show_advanced(window):
@@ -85,8 +87,7 @@ def show_advanced(window):
     window.analysis_workers.show()
     form.addRow(tr('글자 인식 작업자 (각 2 CPU 스레드)'), window.ocr_workers)
     window.ocr_workers.show()
-    form.addRow(window.gpu_decode)
-    window.gpu_decode.show()
+    form.addRow(QLabel(tr('GPU·겹쳐 처리 옵션은 3번 인식 영역 화면에서 변경합니다.')))
     reading.addWidget(performance)
     performance_hint = QLabel(tr('분석 성능 설정은 다음 분석부터 적용됩니다.'))
     performance_hint.setWordWrap(True)
@@ -129,17 +130,106 @@ def _version_group(window):
     group_layout = QVBoxLayout(group)
     status = QLabel(tr('현재 버전 {name}', name=VERSION))
     status.setWordWrap(True)
-    check = window.button(tr('새 버전 확인'), lambda: _check_updates(window, status, check), group_layout, busy=False)
+    row = QHBoxLayout()
+    check = window.button(tr('새 버전 확인'), lambda: _check_updates(window, status, check), row, busy=False)
+    window.button(tr('설치 파일(.exe/.zip)로 업데이트…'), lambda: _install_local_update(window, status), row, busy=False)
+    group_layout.addLayout(row)
     group_layout.addWidget(status)
     return group
 
 
+def _launch_installer_and_close(window, installer_path: Path, args: list[str], status: QLabel):
+    try:
+        window.save_recovery()
+    except Exception:
+        pass
+    started, _ = QProcess.startDetached(str(installer_path), args, str(installer_path.parent))
+    if started:
+        status.setText(tr('업데이트 설치 프로그램을 실행했습니다. 잠시 후 앱이 자동으로 종료됩니다.'))
+        if window.advanced:
+            window.advanced.close()
+        window.close()
+    else:
+        QMessageBox.warning(window.advanced or window, tr('업데이트 실행 실패'),
+                            tr('설치 파일을 실행하지 못했습니다. 파일을 직접 실행해 주세요: {path}', path=installer_path))
+
+
+def _download_and_apply_release(window, info: dict, status: QLabel, check: QPushButton):
+    from tasks import Task
+    from updates import download_installer, installer_upgrade_args
+    installer_url = info.get("installer_url")
+    if not installer_url:
+        QDesktopServices.openUrl(QUrl(info.get("url") or ""))
+        return
+    check.setEnabled(False)
+    updates_dir = window.directory / "updates"
+    app_root = Path(__file__).resolve().parents[1]
+    task = Task(lambda cancel, report: download_installer(installer_url, updates_dir, cancel, report), window.advanced)
+    task.progress.connect(status.setText)
+
+    def finished():
+        check.setEnabled(True)
+        if task.error:
+            status.setText(tr('업데이트 다운로드 실패: {error}', error=task.error))
+        elif task.result:
+            _launch_installer_and_close(window, Path(task.result), installer_upgrade_args(app_root), status)
+
+    task.finished.connect(finished)
+    window.advanced.update_download = task
+    task.start()
+
+
+def _install_local_update(window, status: QLabel):
+    from updates import prepare_local_update
+    chosen, _ = QFileDialog.getOpenFileName(
+        window.advanced or window,
+        tr('업데이트 파일 선택'),
+        str(window.directory),
+        tr('업데이트 파일 (*setup*.exe *.exe *.zip);;모든 파일 (*)'),
+    )
+    if not chosen:
+        return
+    try:
+        result = prepare_local_update(Path(chosen))
+    except (ValueError, OSError) as error:
+        status.setText(str(error))
+        QMessageBox.warning(window.advanced or window, tr('업데이트 실패'), str(error))
+        return
+
+    if result["mode"] == "installer":
+        answer = QMessageBox.question(
+            window.advanced or window,
+            tr('인플레이스 업데이트 설치'),
+            tr('현재 작업 상태를 저장하고 선택한 설치 파일로 덮어쓰기 업데이트를 진행할까요?\n(사용자 데이터·프로필·클립은 그대로 유지됩니다)'),
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            _launch_installer_and_close(window, result["path"], result["args"], status)
+    elif result["mode"] == "zip":
+        status.setText(tr('소스 파일 {count}개를 업데이트했습니다. 재시작하면 적용됩니다.', count=result["updated_files"]))
+        answer = QMessageBox.question(
+            window.advanced or window,
+            tr('업데이트 완료'),
+            tr('파일 {count}개를 업데이트했습니다. 지금 앱을 다시 시작할까요?', count=result["updated_files"]),
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            try:
+                window.save_recovery()
+            except Exception:
+                pass
+            arguments = sys.argv[1:] if getattr(sys, "frozen", False) else sys.orig_argv[1:]
+            started, _ = QProcess.startDetached(sys.executable, arguments, os.getcwd())
+            if started:
+                if window.advanced:
+                    window.advanced.close()
+                window.close()
+
+
 def _check_updates(window, status, check):
     from tasks import Task
-    from updates import VERSION, RELEASES_PAGE, is_newer, latest_release
+    from updates import VERSION, RELEASES_PAGE, is_newer, latest_release_info
     check.setEnabled(False)
     status.setText(tr('새 버전을 확인하는 중입니다…'))
-    task = Task(lambda cancel, report: latest_release(), window.advanced)
+    task = Task(lambda cancel, report: latest_release_info(), window.advanced)
 
     def finished():
         check.setEnabled(True)
@@ -147,12 +237,26 @@ def _check_updates(window, status, check):
             status.setText(tr('새 버전을 확인하지 못했습니다. 인터넷 연결을 확인해 주세요.'))
         elif task.result is None:
             status.setText(tr('아직 공개된 버전이 없습니다. 현재 버전 {name}', name=VERSION))
-        elif is_newer(task.result):
-            status.setText(tr('새 버전 {name}이 있습니다.', name=task.result))
-            answer = QMessageBox.question(window.advanced, tr('앱 버전'),
-                                          tr('새 버전 {name}이 있습니다. 받는 곳을 열까요?', name=task.result))
-            if answer == QMessageBox.StandardButton.Yes:
-                QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
+        elif is_newer(task.result.get("tag", "")):
+            tag = task.result["tag"]
+            status.setText(tr('새 버전 {name}이 있습니다.', name=tag))
+            if task.result.get("installer_url"):
+                dialog = QMessageBox(window.advanced)
+                dialog.setWindowTitle(tr('앱 버전'))
+                dialog.setText(tr('새 버전 {name}이 있습니다. 어떻게 업데이트할까요?', name=tag))
+                auto_btn = dialog.addButton(tr('자동 다운로드 및 업데이트 설치'), QMessageBox.ButtonRole.AcceptRole)
+                web_btn = dialog.addButton(tr('릴리스 페이지 열기'), QMessageBox.ButtonRole.ActionRole)
+                dialog.addButton(tr('취소'), QMessageBox.ButtonRole.RejectRole)
+                dialog.exec()
+                if dialog.clickedButton() == auto_btn:
+                    _download_and_apply_release(window, task.result, status, check)
+                elif dialog.clickedButton() == web_btn:
+                    QDesktopServices.openUrl(QUrl(task.result.get("url") or RELEASES_PAGE))
+            else:
+                answer = QMessageBox.question(window.advanced, tr('앱 버전'),
+                                              tr('새 버전 {name}이 있습니다. 받는 곳을 열까요?', name=tag))
+                if answer == QMessageBox.StandardButton.Yes:
+                    QDesktopServices.openUrl(QUrl(task.result.get("url") or RELEASES_PAGE))
         else:
             status.setText(tr('최신 버전입니다. 현재 버전 {name}', name=VERSION))
 

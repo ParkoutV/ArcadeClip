@@ -23,6 +23,28 @@ from support import run_child
 
 
 class AppTests(unittest.TestCase):
+    def test_analysis_options_stay_on_stage_three_after_settings(self):
+        from PySide6.QtCore import QSettings
+        from advanced_settings import show_advanced
+        keys = ['analysis/' + name for name in ('gpu_decode', 'gpu_convert', 'analysis_pipeline')]
+        with tempfile.TemporaryDirectory() as name:
+            settings = QSettings(str(Path(name) / 'settings.ini'), QSettings.Format.IniFormat)
+            with patch.object(MainWindow, 'refresh_catalog_summary'), \
+                    patch('workspace_ui.QSettings', return_value=settings), \
+                    patch('advanced_settings.QSettings', return_value=settings):
+                window = MainWindow(Path(name))
+                controls = [window.gpu_decode, window.gpu_convert, window.analysis_pipeline]
+                parents = [control.parent() for control in controls]
+                for control in controls:
+                    self.assertIn(control, window.busy_controls)
+                    control.setChecked(False)
+                    control.setChecked(True)
+                show_advanced(window)
+                self.assertEqual(parents, [control.parent() for control in controls])
+                for key in keys:
+                    self.assertTrue(settings.value(key, type=bool))
+                window.advanced.close()
+
     @classmethod
     def setUpClass(cls):
         cls.application = QApplication.instance() or QApplication([])
@@ -1024,8 +1046,10 @@ print('setup cycles passed')
                 play.assert_not_called()
                 with patch.object(window.preview.player, "isPlaying", return_value=True), patch.object(window.preview.player, "position", return_value=5000), patch.object(window, "step_frame") as frame:
                     QTest.keyClick(window.preview.canvas, Qt.Key.Key_Right)
+                    window.preview.flush_seek()
                     seek.assert_called_with(6)
                     QTest.keyClick(window.preview.canvas, Qt.Key.Key_Left)
+                    window.preview.flush_seek()
                     seek.assert_called_with(4)
                     frame.assert_not_called()
                 with patch.object(window.preview.player, "isPlaying", return_value=False), patch.object(window, "step_frame") as frame:
@@ -1510,6 +1534,95 @@ print('setup cycles passed')
                     dialog._prepare(None, lambda _: None)
                 catalog.assert_not_called()
             dialog.close()
+
+    def test_window_stream_controls_and_completion_flow(self):
+        from PySide6.QtCore import QSettings
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat)
+            with patch.object(MainWindow, "refresh_catalog_summary"), \
+                    patch("workspace_ui.QSettings", return_value=settings), \
+                    patch("app.QSettings", return_value=settings), \
+                    patch.object(MainWindow, "select_file"):
+                window = MainWindow(root)
+                self.assertFalse(window.stream_auto_clip.isChecked())
+                self.assertEqual(window.stream_stop_button.text(), "수신 정지 · 시간 선택으로")
+                self.assertEqual(window.stream_port.value(), 1935)
+                window.stream_protocol.setCurrentIndex(1)
+                self.assertEqual(window.stream_port.value(), 9000)
+                window.stream_host.setText("myarcade.iptime.org")
+                self.assertIn("srt://myarcade.iptime.org:9000", window.stream_server_url.text())
+
+                QApplication.clipboard().setText("https://www.youtube.com/watch?v=abcdefghijk")
+                window.paste_obs_youtube_url()
+                self.assertEqual(window.stream_mode.currentData(), "youtube")
+                self.assertEqual(window.stream_youtube_url.text(), "https://www.youtube.com/watch?v=abcdefghijk")
+                self.assertEqual(window.stream_start_button.text(), "개별 라이브 녹화 시작")
+                self.assertFalse(window.stream_stop_button.isEnabled())
+
+                window.stream_auto_clip.setChecked(True)
+                self.assertEqual(window.stream_stop_button.text(), "수신 정지 · 클립 생성")
+                with patch.object(window, 'run_task') as task, \
+                     patch('stream_ingest.watch_youtube_stream', return_value={'path': root / 'stream.ts'}) as watch, \
+                     patch('stream_ingest.auto_clip_session', return_value={}) as auto_clip_call:
+                    window.start_stream_ingest()
+                    operation = task.call_args.args[0]
+                    import threading
+                    outcome = operation(threading.Event(), lambda _: None)
+                    self.assertTrue(outcome['profile_missing'])
+                    self.assertIsNone(auto_clip_call.call_args.args[1])
+                    self.assertFalse(auto_clip_call.call_args.kwargs['auto_export'])
+                    self.assertEqual(watch.call_args.args[1], root / 'streams')
+                    self.assertIs(watch.call_args.kwargs['stop_event'], window.stream_stop_event)
+                    self.assertNotIn('wait_for_end', watch.call_args.kwargs)
+
+                window.stream_auto_clip.setChecked(False)
+                video = root / "stream.ts"
+                video.write_bytes(b"video")
+                window.stream_ingest_finished({
+                    "path": video,
+                    "duration": 150.0,
+                    "metadata": {"title": "OBS SRT Stream", "video_date": "2026-10-21"},
+                    "originals": [],
+                    "clips": [],
+                    "exported": {"saved": [], "failed": [], "cancelled": False},
+                })
+                self.assertEqual(window.stage, 1)
+                self.assertEqual(window.start_time.text(), "00:00:00.000")
+                self.assertEqual(window.end_time.text(), "00:02:30.000")
+                self.assertEqual(window.selected_times(), (0.0, 150.0))
+                window.set_stage(2)
+                self.assertEqual(window.stage, 2)
+                self.assertIn("00:02:30.000", window.analysis_range_summary.text())
+
+                clip = {
+                    "clip_id": "clip1",
+                    "source": str(video),
+                    "start": 10.0,
+                    "end": 120.0,
+                    "title": "Song A",
+                    "image_url": "song_a.png",
+                    "player": "P1",
+                    "achievement": 100.1234,
+                    "selected": True,
+                }
+                window.stream_ingest_finished({
+                    "path": video,
+                    "duration": 150.0,
+                    "metadata": {"title": "OBS SRT Stream", "video_date": "2026-10-21"},
+                    "originals": [clip],
+                    "clips": [clip],
+                    "exported": {"saved": [str(root / "clip.mp4")], "failed": [], "cancelled": False},
+                })
+                self.assertEqual(window.files.count(), 1)
+                self.assertEqual(len(window.ranges), 1)
+                self.assertEqual(window.stage, 3)
+                window.set_stage(1)
+                self.assertEqual(window.stage, 1)
+                self.assertEqual(window.selected_times(), (0.0, 150.0))
+                window.set_stage(2)
+                self.assertEqual(window.stage, 2)
+                window.close()
 
 
 if __name__ == "__main__":

@@ -5,10 +5,16 @@ __pycache__/
 *.dist/
 *.onefile-build/
 dist/
+dist/installers/
 build/
+build/installer-tools/
+build/installer-fixture/
 tools/
 *.exe
 *.bin
+*.zip
+*.sha256
+*.log
 
 run/deployment/
 
@@ -16,3 +22,8 @@ run/deployment/
 /tmp/
 
 ai_docs
+
+# Native helpers are compiled from run/gpu_roi.c for each release architecture.
+src/assets/gpu_roi*.dll
+src/assets/gpu_roi*.pdb
+src/assets/gpu_roi*.lib

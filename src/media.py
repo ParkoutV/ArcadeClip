@@ -3,6 +3,7 @@ from i18n import tr
 import math
 import re
 import struct
+import gc
 from pathlib import Path
 from fractions import Fraction
 
@@ -27,7 +28,18 @@ def format_time(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{milliseconds / 1000:06.3f}"
 
 
-def oriented_image(frame, *, region=None, reference_size=None):
+_metadata_bytes = 0
+
+
+def image_geometry(frame, region=None, reference_size=None):
+    global _metadata_bytes
+    # PyAV side_data retains its parent frame in a cycle. Collect before reading
+    # another metadata object once native buffers, invisible to GC, exceed 16MiB.
+    # Reachable reference frames (e.g. BoundaryBuffer) are preserved by GC.
+    if _metadata_bytes >= 16 * 1024**2:
+        gc.collect()
+        _metadata_bytes = 0
+    _metadata_bytes += frame.width * frame.height * 2
     for side in frame.side_data:
         if side.type.name != "DISPLAYMATRIX":
             continue
@@ -46,6 +58,20 @@ def oriented_image(frame, *, region=None, reference_size=None):
     box = tuple(round(v * size) for v, size in zip(region, (width, height) * 2)) if region is not None else None
     if box == (0, 0, width, height):
         box = None
+    return angle, width, height, box
+
+
+def oriented_image(frame, *, region=None, reference_size=None, converter=None):
+    if frame.format.name == 'd3d11':
+        if converter is not None:
+            return converter.convert(frame, region=region, reference_size=reference_size)
+        from gpu_image import GPUImageConverter
+        gpu = GPUImageConverter()
+        try:
+            return gpu.convert(frame, region=region, reference_size=reference_size)
+        finally:
+            gpu.close()
+    angle, width, height, box = image_geometry(frame, region, reference_size)
     if box is not None and not angle and frame.format.name == "yuv420p" and width % 32 == 0 and height % 2 == 0:
         x0, y0, x1, y1 = box
         if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:

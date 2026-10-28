@@ -1,0 +1,750 @@
+diff --git a/run/benchmark_match_reuse.py b/run/benchmark_match_reuse.py
+new file mode 100644
+--- /dev/null
++++ b/run/benchmark_match_reuse.py
+@@ -0,0 +1,47 @@
++"""Synthetic matching-only comparison; not a video decode or OCR benchmark."""
++import json
++from pathlib import Path
++import sys
++import threading
++from time import perf_counter
++
++import numpy as np
++from PIL import Image
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
++from analysis_common import DEFAULTS
++from jacket_recognition import _identify_batch, identify, phash
++
++
++def main():
++    rng = np.random.default_rng(42)
++    images = [Image.fromarray(rng.integers(0, 256, (80, 80, 3), dtype=np.uint8)) for _ in range(3)]
++    catalog = [{'hash': phash(image), 'image_url': f'{i}.png', 'title': str(i)}
++               for i, image in enumerate(images)]
++    catalog += [{'hash': int(h), 'image_url': f'extra{i}.png', 'title': str(i)}
++                for i, h in enumerate(rng.integers(0, 2**64-1, 1497, dtype=np.uint64))]
++    results = []
++    for name, frames in [('repeated', [images[0]] * 2000),
++                         ('changing', [images[i % 3] for i in range(2000)])]:
++        old_times, new_times = [], []
++        for repeat in range(4):
++            cache, actual = {}, []
++            started = perf_counter()
++            expected = [(i, identify(im, catalog, DEFAULTS, search=False)) for i, im in enumerate(frames)]
++            baseline_s = perf_counter() - started
++            started = perf_counter()
++            for i, im in enumerate(frames):
++                actual.extend(_identify_batch([(i, im)], catalog, DEFAULTS, threading.Event(), cache))
++            cached_s = perf_counter() - started
++            assert actual == expected
++            if repeat:  # warm up both paths before collecting timings
++                old_times.append(baseline_s)
++                new_times.append(cached_s)
++        results.append(dict(case=name, frames=len(frames), catalog=len(catalog),
++                            baseline_s=old_times, cached_s=new_times,
++                            speedup=float(np.median(old_times) / np.median(new_times)), identical=True))
++    print(json.dumps(results, indent=2))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/freeplay.py b/src/freeplay.py
+new file mode 100644
+--- /dev/null
++++ b/src/freeplay.py
+@@ -0,0 +1,77 @@
++"""Optional Free Play reset evidence from the existing video decode pass."""
++import re
++
++from analysis_common import check_cancel
++from media import oriented_image
++
++
++class ResetTracker:
++    """Require a directional run and two consecutive exact endpoint readings.
++
++    A rising score can reset to 0; a falling remaining score can reset to 101.
++    This avoids treating a normal increasing score reaching 101 as a restart.
++    Events retain the pre-reset evidence time so they cannot bridge song changes.
++    """
++    def __init__(self):
++        self.previous = None
++        self.direction = 0
++        self.pending = None
++        self.events = []
++
++    def feed(self, seconds, value):
++        if value is None:
++            self.previous = self.pending = None
++            self.direction = 0
++            return
++        if self.pending is not None:
++            before, boundary, endpoint = self.pending
++            self.pending = None
++            if value == endpoint:
++                self.events.append((before, boundary, seconds))
++                self.previous = (seconds, value)
++                self.direction = 0
++                return
++        if self.previous is not None:
++            timestamp, previous = self.previous
++            if ((value == 0 and previous > 0 and self.direction > 0)
++                    or (value == 101 and previous < 101 and self.direction < 0)):
++                self.pending = (timestamp, seconds, value)
++            elif abs(value - previous) >= .0001:
++                self.direction = 1 if value > previous else -1
++        self.previous = (seconds, value)
++
++
++class FreePlayObserver:
++    def __init__(self, read, region, size, start, interval, cancel):
++        self.read, self.region, self.size = read, region, size
++        self.target, self.interval, self.cancel = start, interval, cancel
++        self.tracker = ResetTracker()
++
++    def observe(self, seconds, frame):
++        if seconds + 1e-7 < self.target:
++            return
++        self.target = seconds + self.interval
++        check_cancel(self.cancel)
++        image = oriented_image(frame, region=self.region, reference_size=self.size)
++        text, confidence = self.read(image)
++        # Strict parsing: a stray digit must not manufacture a reset endpoint.
++        match = re.fullmatch(r"\s*(\d{1,3}(?:\.\d{1,4})?)\s*[%％]?\s*", text)
++        value = float(match[1]) if match and confidence >= .9 else None
++        self.tracker.feed(seconds, value if value is not None and 0 <= value <= 101 else None)
++
++    def split(self, candidates):
++        rows = []
++        for candidate in candidates:
++            left = candidate["start"]
++            if candidate.get("image_url"):
++                for before, boundary, confirmed in self.tracker.events:
++                    if left <= before < boundary < confirmed < candidate["end"]:
++                        rows.append({**candidate, "start": left, "end": boundary})
++                        left = boundary
++            rows.append({**candidate, "start": left})
++        return rows
++
++    def close(self):
++        close = getattr(self.read, "close", None)
++        if close is not None:
++            close()
+diff --git a/src/jacket_recognition.py b/src/jacket_recognition.py
+--- a/src/jacket_recognition.py
++++ b/src/jacket_recognition.py
+@@ -1,7 +1,7 @@
+ """Default song recognizer: pHash catalog, jacket calibration and boundary refinement."""
+ from i18n import tr
+ from collections import deque
+-from concurrent.futures import ProcessPoolExecutor, TimeoutError
++from concurrent.futures import CancelledError, ProcessPoolExecutor, TimeoutError
+ from bisect import bisect_right
+ import logging
+ import math
+@@ -62,18 +62,19 @@
+     return entries
+ 
+ 
+-def identify(image, catalog, options, previous=None, cancel=None, *, search=True, local_only=False):
++def identify(image, catalog, options, previous=None, cancel=None, *, search=True, local_only=False,
++             match_cache=None):
+     """Search square subwindows, then verify/track the prior location as in maipage."""
+     if not catalog:
+         raise ValueError(tr('사용 가능한 자켓이 없습니다.'))
+-    hashes = np.array([row["hash"] for row in catalog], dtype=np.uint64)
++    hashes = None
+     width, height = image.size
+     shortest = min(width, height)
+     best = None
+     seen = set()
+ 
+     def evaluate(rect):
+-        nonlocal best
++        nonlocal best, hashes
+         if rect in seen:
+             return None
+         seen.add(rect)
+@@ -82,7 +83,18 @@
+         x0, y0, x1, y1 = rect
+         if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+             return None
+-        distances = np.bitwise_count(hashes ^ np.uint64(phash(image.crop(rect))))
++        fingerprint = phash(image.crop(rect))
++        # Scan-local, single-entry cache. Exact pHash equality gives exactly the
++        # same catalog distances; approximate equality could hide a song change.
++        # Keep the current rectangle and never cache an unrecognized observation.
++        if match_cache is not None and match_cache.get("hash") == fingerprint:
++            result = {**match_cache["result"], "sub_rect": list(rect)}
++            if best is None or (result["distance"], -result["margin"]) < (best["distance"], -best["margin"]):
++                best = result
++            return result
++        if hashes is None:
++            hashes = np.array([row["hash"] for row in catalog], dtype=np.uint64)
++        distances = np.bitwise_count(hashes ^ np.uint64(fingerprint))
+         ranked = np.argsort(distances, kind="stable")[:2]
+         index = int(ranked[0])
+         distance = int(distances[index])
+@@ -92,6 +104,10 @@
+                   "song_id": catalog[index]["image_url"] if found else None,
+                   "title": catalog[index]["title"] if found else "", "distance": distance,
+                   "margin": margin, "sub_rect": list(rect)}
++        if match_cache is not None:
++            match_cache.clear()
++            if found:
++                match_cache.update(hash=fingerprint, result=dict(result))
+         if best is None or (distance, -margin) < (best["distance"], -best["margin"]):
+             best = result
+         return result
+@@ -99,7 +115,7 @@
+     if not search:
+         return evaluate((0, 0, width, height))
+ 
+-    # Always compare against the whole catalog so a changed song cannot remain locked.
++    # Changed hashes still use the whole catalog so a changed song cannot remain locked.
+     if previous and previous.get("sub_rect"):
+         old = tuple(previous["sub_rect"])
+         result = evaluate(old)
+@@ -149,24 +165,30 @@
+ 
+ 
+ def _init_analysis_worker(catalog, options, stop):
+-    global _worker_catalog, _worker_options, _worker_stop
++    global _worker_catalog, _worker_options, _worker_stop, _worker_match_cache
+     _worker_catalog, _worker_options, _worker_stop = catalog, options, stop
+-
+-
+-def _identify_batch(batch, catalog, options, stop):
++    _worker_match_cache = {}
++
++
++def _identify_batch(batch, catalog, options, stop, match_cache=None):
++    # The caller retains this across batches; each process owns its own cache.
++    if match_cache is None:
++        match_cache = {}
+     previous, results = None, []
+     for sample in batch:
+         seconds, image = sample[:2]
+         check_cancel(stop)
+-        previous = (identify(image, catalog, options, {"sub_rect": sample[2]}, stop, local_only=True)
+-                    if len(sample) == 3 else identify(image, catalog, options, cancel=stop, search=False))
++        previous = (identify(image, catalog, options, {"sub_rect": sample[2]}, stop, local_only=True,
++                             match_cache=match_cache)
++                    if len(sample) == 3 else identify(image, catalog, options, cancel=stop, search=False,
++                                                     match_cache=match_cache))
+         results.append((seconds, previous))
+     return results
+ 
+ 
+ def _worker_batch(batch):
+     began = perf_counter()
+-    result = _identify_batch(batch, _worker_catalog, _worker_options, _worker_stop)
++    result = _identify_batch(batch, _worker_catalog, _worker_options, _worker_stop, _worker_match_cache)
+     return os.getpid(), result, perf_counter() - began
+ 
+ 
+@@ -178,6 +200,7 @@
+     metrics["result_wait_s"] = 0.
+     scan_started, last_log = perf_counter(), float("-inf")
+     pending = deque()
++    match_cache = {}
+     def log_queue(done, force=False):
+         nonlocal last_log
+         now = perf_counter()
+@@ -198,7 +221,7 @@
+         log_queue(done, total is not None and done >= total)
+     def match(batch):
+         began = perf_counter()
+-        result = _identify_batch(batch, catalog, options, cancel)
++        result = _identify_batch(batch, catalog, options, cancel, match_cache)
+         metrics["match_s"] += perf_counter() - began
+         if on_observation is not None:
+             for seconds, observation in result:
+@@ -366,6 +389,35 @@
+     # Keep the existing synchronous boundary observer/match ownership unchanged.
+     pipelined = pipelined and buffer is None
+     metrics['pipelined'] = pipelined
++    freeplay = None
++    if options.get("freeplay_resets"):
++        if "achievement" not in profile["regions"]:
++            result["warnings"].append(tr('Free Play 보정에는 플레이 중 1P 달성률 영역이 필요합니다.'))
++        else:
++            from freeplay import FreePlayObserver
++            from text_recognition import make_ocr
++            try:
++                freeplay = FreePlayObserver(make_ocr(directory, cancel, report),
++                    profile["regions"]["achievement"], profile["size"], start,
++                    options["sample_seconds"], cancel)
++            except CancelledError:
++                raise
++            except Exception as error:
++                result["warnings"].append(tr('Free Play 보정 준비 실패: {error}', error=error))
++
++    def observe_frame(seconds, frame):
++        nonlocal freeplay
++        if buffer:
++            buffer.observe(seconds, frame)
++        if freeplay:
++            try:
++                freeplay.observe(seconds, frame)
++            except CancelledError:
++                raise
++            except Exception as error:
++                freeplay.close()
++                freeplay = None
++                result["warnings"].append(tr('Free Play 보정 실패: {error}', error=error))
+     def rectangle(region, seconds):
+         if anchors:
+             return location_at(anchors, seconds)
+@@ -377,7 +429,7 @@
+                                                 threads, metrics, gpu, report, result["warnings"],
+                                                 gpu_convert=gpu_convert, pipelined=pipelined,
+                                                 region=profile["regions"]["jacket"], reference_size=profile["size"],
+-                                                on_frame=buffer.observe if buffer else None):
++                                                on_frame=observe_frame if buffer or freeplay else None):
+             yield seconds, image, rectangle(image, seconds)
+     source = frames()
+     if pipelined:
+@@ -389,6 +441,8 @@
+                                     on_observation=buffer.matched if buffer else None)
+     finally:
+         source.close()
++        if freeplay:
++            freeplay.close()
+         if buffer:
+             buffer.finish_scan()
+     if buffer:
+@@ -414,6 +468,8 @@
+                 break
+         progress(report, 4, index, max(1, len(candidates) - 1), tr('곡 경계 정밀 확인'))
+     progress(report, 4, 1, 1, tr('곡 경계 확인 완료'))
++    if freeplay:
++        candidates = freeplay.split(candidates)
+     return {**result, "candidates": candidates}
+ 
+ 
+diff --git a/src/locales/en/LC_MESSAGES/arcadeclip.mo b/src/locales/en/LC_MESSAGES/arcadeclip.mo
+index fd00140759d6f3f26b86ea44772bb9aa740f3713..a63678777896de7028de9eff8268d481fd32e552 100644
+GIT binary patch
+delta 12432
+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
+
+delta 11652
+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
+IeQkRE9~sfz{{R30
+
+diff --git a/src/locales/en/LC_MESSAGES/arcadeclip.po b/src/locales/en/LC_MESSAGES/arcadeclip.po
+--- a/src/locales/en/LC_MESSAGES/arcadeclip.po
++++ b/src/locales/en/LC_MESSAGES/arcadeclip.po
+@@ -2856,6 +2856,21 @@
+ msgid "인증서를 다시 확인하고 있습니다. 앱에 포함된 인증서로 한 번 더 연결합니다."
+ msgstr "Checking certificates again. Retrying once with the certificates included in the app."
+ 
++msgid "Free Play 보정에는 플레이 중 1P 달성률 영역이 필요합니다."
++msgstr "Free Play correction requires the in-play 1P achievement region."
++
++msgid "Free Play 보정 준비 실패: {error}"
++msgstr "Could not prepare Free Play correction: {error}"
++
++msgid "Free Play 보정 실패: {error}"
++msgstr "Free Play correction failed: {error}"
++
++msgid "Free Play: 달성률 초기화로 같은 곡 재시작 구분"
++msgstr "Free Play: split repeated songs when achievement resets"
++
++msgid "1P 달성률의 0%·101% 초기화를 확인합니다. 플레이 중 달성률 영역을 지정하세요. 추가 OCR로 분석 시간이 늘어납니다."
++msgstr "Check 1P achievement resets to 0% or 101%. Select the in-play achievement region. Additional OCR increases analysis time."
++
+ msgid "GPU 영상 디코딩"
+ msgstr "GPU video decoding"
+ 
+diff --git a/src/profile_panel.py b/src/profile_panel.py
+--- a/src/profile_panel.py
++++ b/src/profile_panel.py
+@@ -11,7 +11,7 @@
+ from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+ from preview import VideoCanvas
+ from PySide6.QtWidgets import (
+-    QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
++    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+     QInputDialog, QMessageBox, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget, QDialogButtonBox,
+ )
+ 
+@@ -477,9 +477,17 @@
+             (text_form if key == "ocr_tail_seconds" else jacket_form).addRow(label, field)
+             fields[key] = field
+ 
++        freeplay = QCheckBox(tr('Free Play: 달성률 초기화로 같은 곡 재시작 구분'))
++        freeplay.setObjectName("freeplay_resets")
++        freeplay.setChecked(options.get("freeplay_resets", False))
++        freeplay.setToolTip(tr('1P 달성률의 0%·101% 초기화를 확인합니다. 플레이 중 달성률 영역을 지정하세요. 추가 OCR로 분석 시간이 늘어납니다.'))
++        text_form.addRow(freeplay)
++
+         def keep():
+             self.recognition_options = {key: field.value() for key, field in fields.items()}
+-
++            self.recognition_options["freeplay_resets"] = freeplay.isChecked()
++
++        freeplay.toggled.connect(keep)
+         for field in fields.values():
+             field.valueChanged.connect(keep)
+         jacket_hint = QLabel(tr('곡 확인 간격이 짧을수록 더 자주 확인합니다.\n자켓 차이 허용값을 높이면 더 느슨하게 인식합니다.\n두 후보의 최소 점수 차이를 높이면 비슷한 자켓을 더 엄격하게 구분합니다.'))
+diff --git a/src/profiles.py b/src/profiles.py
+--- a/src/profiles.py
++++ b/src/profiles.py
+@@ -43,7 +43,9 @@
+         options = value["recognition"]
+         limits = {"sample_seconds": (.1, 5), "stable_seconds": (.1, 10),
+                   "hash_distance": (0, 64), "hash_margin": (0, 64), "ocr_tail_seconds": (.1, 10), "location_seconds": (1, 120)}
+-        if not isinstance(options, dict) or set(options) - (set(limits) | {"ocr_language"}):
++        if not isinstance(options, dict) or set(options) - (set(limits) | {"ocr_language", "freeplay_resets"}):
++            raise ValueError(tr('인식 설정 형식을 확인해 주세요.'))
++        if "freeplay_resets" in options and type(options["freeplay_resets"]) is not bool:
+             raise ValueError(tr('인식 설정 형식을 확인해 주세요.'))
+         for key, (low, high) in limits.items():
+             if key in options and (type(options[key]) not in (int, float)
+diff --git a/src/tests/test_freeplay.py b/src/tests/test_freeplay.py
+new file mode 100644
+--- /dev/null
++++ b/src/tests/test_freeplay.py
+@@ -0,0 +1,59 @@
++"""Reset evidence must split repeats without mistaking normal score progression."""
++import threading
++import unittest
++from unittest.mock import Mock
++
++import av
++from PIL import Image
++
++from freeplay import FreePlayObserver, ResetTracker
++from profiles import validate_profile
++
++
++class FreePlayTests(unittest.TestCase):
++    def events(self, values):
++        tracker = ResetTracker()
++        for t, value in enumerate(values):
++            tracker.feed(t, value)
++        return tracker.events
++
++    def test_both_reset_directions_and_no_duplicate_during_hold(self):
++        self.assertEqual(self.events([10, 20, 0, 0, 0, 10, 20, 0, 0]),
++                         [(1, 2, 3), (6, 7, 8)])
++        self.assertEqual(self.events([100, 90, 101, 101, 101]), [(1, 2, 3)])
++        self.assertEqual(self.events([100.9, 100.8, 101, 101]), [(1, 2, 3)])
++        self.assertEqual(self.events([.1, .2, 0, 0]), [(1, 2, 3)])
++
++    def test_normal_endpoint_arrival_and_initial_endpoint_do_not_split(self):
++        for values in ([0, 0, 10, 50, 100, 101, 101], [101, 101, 90, 20, 0, 0],
++                       [0, 0, 0], [101, 101, 101], [10, 20, 0, 21],
++                       [10, 20, None, 0, 0], [10, 20, 0, None, 0]):
++            with self.subTest(values=values):
++                self.assertEqual(self.events(values), [])
++
++    def test_strict_ocr_confidence_and_sampling(self):
++        read = Mock(side_effect=[('10.0000%', .99), ('20.0000％', .99),
++                                 ('0.0000%', .99), ('0%', .99), ('101x', .99), ('0', .5)])
++        observer = FreePlayObserver(read, [0, 0, 1, 1], [20, 20], 0, 1, threading.Event())
++        frame = av.VideoFrame.from_image(Image.new('RGB', (20, 20)))
++        for t in (0, .5, 1, 2, 3, 4, 5):
++            observer.observe(t, frame)
++        self.assertEqual(read.call_count, 6)
++        self.assertEqual(observer.tracker.events, [(1, 2, 3)])
++        self.assertIsNone(observer.tracker.previous)
++
++    def test_split_only_inside_recognized_candidate_with_prior_evidence(self):
++        observer = FreePlayObserver(None, None, None, 0, 1, threading.Event())
++        observer.tracker.events = [(1, 2, 3), (4, 5, 6), (8, 9, 10)]
++        rows = observer.split([{'start': 0, 'end': 4, 'image_url': 'a.png'},
++                               {'start': 4, 'end': 8, 'image_url': None},
++                               {'start': 9, 'end': 12, 'image_url': 'a.png'}])
++        self.assertEqual([(r['start'], r['end']) for r in rows], [(0, 2), (2, 4), (4, 8), (9, 12)])
++
++    def test_profile_requires_boolean_and_preserves_option(self):
++        profile = {'version': 1, 'name': 'test', 'size': [100, 100],
++                   'regions': {'jacket': [0, 0, 1, 1]}, 'recognition': {'freeplay_resets': True}}
++        self.assertTrue(validate_profile(profile)['recognition']['freeplay_resets'])
++        profile['recognition']['freeplay_resets'] = 1
++        with self.assertRaises(ValueError):
++            validate_profile(profile)
+diff --git a/src/tests/test_recognition.py b/src/tests/test_recognition.py
+--- a/src/tests/test_recognition.py
++++ b/src/tests/test_recognition.py
+@@ -23,6 +23,61 @@
+ 
+ 
+ class RecognitionTests(unittest.TestCase):
++    def test_freeplay_splits_same_jacket_using_existing_decode_callback(self):
++        import jacket_recognition as jackets
++        from unittest.mock import Mock
++        profile = deepcopy(self.profile)
++        profile["regions"]["achievement"] = [0, 0, .5, 8 / 9]
++        profile["recognition"].update(freeplay_resets=True, sample_seconds=1)
++        read = Mock(side_effect=[(str(v), .99) for v in (10, 20, 0, 0, 10, 20, 0, 0)])
++        def decoded(*args, **kwargs):
++            frame = av.VideoFrame.from_image(self.images[0].resize((160, 90)))
++            for t in range(8):
++                kwargs["on_frame"](t, frame)
++                yield t, self.images[0]
++        with patch("jacket_recognition.calibrate_locations", return_value=[(0, [0, 0, 80, 80])]), \
++                patch("jacket_recognition.analysis_samples", side_effect=decoded), \
++                patch("jacket_recognition.BoundaryBuffer", return_value=None), \
++                patch("text_recognition.make_ocr", return_value=read):
++            result = jackets.detect("unused", 0, 8, profile, self.root, self.cancel, lambda _: None)
++        self.assertEqual([(r["start"], r["end"]) for r in result["candidates"]], [(0, 2), (2, 6), (6, 8)])
++        self.assertEqual({r["image_url"] for r in result["candidates"]}, {"0.png"})
++        self.assertEqual(read.call_count, 8)
++        read.close.assert_called_once()
++
++    def test_unchanged_jacket_reuses_match_across_batches_without_hiding_transitions(self):
++        from jacket_recognition import _identify_batch
++        catalog = load_catalog(self.root, self.cancel, lambda _: None)
++        # Repeat A, change to B, lose the jacket, then repeat A as a new play.
++        sequence = [self.images[i] for i in (0, 0, 1, 1, 2, 2, 0, 0)]
++        expected = [(float(i), identify(image, catalog, DEFAULTS, search=False))
++                    for i, image in enumerate(sequence)]
++        cache, actual = {}, []
++        with patch("jacket_recognition.np.argsort", wraps=np.argsort) as ranked:
++            for i, image in enumerate(sequence):
++                actual.extend(_identify_batch([(float(i), image)], catalog, DEFAULTS, self.cancel, cache))
++        self.assertEqual(actual, expected)
++        self.assertEqual(ranked.call_count, 5)  # A, B, two unknowns, then A again.
++        self.assertIsNone(actual[4][1]["image_url"])
++        self.assertEqual(_candidates(actual, 0, 8, 1), _candidates(expected, 0, 8, 1))
++
++    def test_cached_hash_keeps_current_rectangle_and_checks_cancellation(self):
++        from jacket_recognition import _identify_batch
++        catalog = load_catalog(self.root, self.cancel, lambda _: None)
++        image = Image.new("RGB", (160, 80))
++        image.paste(self.images[0], (0, 0))
++        image.paste(self.images[0], (80, 0))
++        cache = {}
++        with patch("jacket_recognition.np.argsort", wraps=np.argsort) as ranked:
++            rows = _identify_batch([(0, image, [0, 0, 80, 80]), (1, image, [80, 0, 160, 80])],
++                                   catalog, DEFAULTS, self.cancel, cache)
++        self.assertEqual(ranked.call_count, 1)
++        self.assertEqual(rows[0][1]["sub_rect"], [0, 0, 80, 80])
++        self.assertEqual(rows[1][1]["sub_rect"], [80, 0, 160, 80])
++        self.cancel.set()
++        with self.assertRaises(CancelledError):
++            _identify_batch([(2, self.images[0])], catalog, DEFAULTS, self.cancel, cache)
++
+     def test_boundary_buffer_matches_redecode_and_falls_back_at_memory_limit(self):
+         import jacket_recognition as jackets
+         from boundary_buffer import BoundaryBuffer

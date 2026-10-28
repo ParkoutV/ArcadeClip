@@ -23,6 +23,61 @@ from video_sampling import samples
 
 
 class RecognitionTests(unittest.TestCase):
+    def test_freeplay_splits_same_jacket_using_existing_decode_callback(self):
+        import jacket_recognition as jackets
+        from unittest.mock import Mock
+        profile = deepcopy(self.profile)
+        profile["regions"]["achievement"] = [0, 0, .5, 8 / 9]
+        profile["recognition"].update(freeplay_resets=True, sample_seconds=1)
+        read = Mock(side_effect=[(str(v), .99) for v in (10, 20, 0, 0, 10, 20, 0, 0)])
+        def decoded(*args, **kwargs):
+            frame = av.VideoFrame.from_image(self.images[0].resize((160, 90)))
+            for t in range(8):
+                kwargs["on_frame"](t, frame)
+                yield t, self.images[0]
+        with patch("jacket_recognition.calibrate_locations", return_value=[(0, [0, 0, 80, 80])]), \
+                patch("jacket_recognition.analysis_samples", side_effect=decoded), \
+                patch("jacket_recognition.BoundaryBuffer", return_value=None), \
+                patch("text_recognition.make_ocr", return_value=read):
+            result = jackets.detect("unused", 0, 8, profile, self.root, self.cancel, lambda _: None)
+        self.assertEqual([(r["start"], r["end"]) for r in result["candidates"]], [(0, 2), (2, 6), (6, 8)])
+        self.assertEqual({r["image_url"] for r in result["candidates"]}, {"0.png"})
+        self.assertEqual(read.call_count, 8)
+        read.close.assert_called_once()
+
+    def test_unchanged_jacket_reuses_match_across_batches_without_hiding_transitions(self):
+        from jacket_recognition import _identify_batch
+        catalog = load_catalog(self.root, self.cancel, lambda _: None)
+        # Repeat A, change to B, lose the jacket, then repeat A as a new play.
+        sequence = [self.images[i] for i in (0, 0, 1, 1, 2, 2, 0, 0)]
+        expected = [(float(i), identify(image, catalog, DEFAULTS, search=False))
+                    for i, image in enumerate(sequence)]
+        cache, actual = {}, []
+        with patch("jacket_recognition.np.argsort", wraps=np.argsort) as ranked:
+            for i, image in enumerate(sequence):
+                actual.extend(_identify_batch([(float(i), image)], catalog, DEFAULTS, self.cancel, cache))
+        self.assertEqual(actual, expected)
+        self.assertEqual(ranked.call_count, 5)  # A, B, two unknowns, then A again.
+        self.assertIsNone(actual[4][1]["image_url"])
+        self.assertEqual(_candidates(actual, 0, 8, 1), _candidates(expected, 0, 8, 1))
+
+    def test_cached_hash_keeps_current_rectangle_and_checks_cancellation(self):
+        from jacket_recognition import _identify_batch
+        catalog = load_catalog(self.root, self.cancel, lambda _: None)
+        image = Image.new("RGB", (160, 80))
+        image.paste(self.images[0], (0, 0))
+        image.paste(self.images[0], (80, 0))
+        cache = {}
+        with patch("jacket_recognition.np.argsort", wraps=np.argsort) as ranked:
+            rows = _identify_batch([(0, image, [0, 0, 80, 80]), (1, image, [80, 0, 160, 80])],
+                                   catalog, DEFAULTS, self.cancel, cache)
+        self.assertEqual(ranked.call_count, 1)
+        self.assertEqual(rows[0][1]["sub_rect"], [0, 0, 80, 80])
+        self.assertEqual(rows[1][1]["sub_rect"], [80, 0, 160, 80])
+        self.cancel.set()
+        with self.assertRaises(CancelledError):
+            _identify_batch([(2, self.images[0])], catalog, DEFAULTS, self.cancel, cache)
+
     def test_boundary_buffer_matches_redecode_and_falls_back_at_memory_limit(self):
         import jacket_recognition as jackets
         from boundary_buffer import BoundaryBuffer
@@ -323,6 +378,13 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(events[-1]["done"], events[-1]["total"])
         parallel = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None, workers=2)
         self.assertEqual(parallel["clips"], result["clips"])
+        overlapped = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None,
+                             workers=2, pipelined=True, gpu_convert=False)
+        self.assertEqual(overlapped['clips'], result['clips'])
+        preserved = analyze(path, 0, 10, profile, self.root, self.cancel, lambda _: None,
+                           workers=1, pipelined=True, gpu_convert=False)
+        self.assertEqual(preserved['clips'], result['clips'])
+        self.assertFalse(preserved['scan_metrics']['pipelined'])
         for left, right in zip(result["clips"], result["clips"][1:]):
             self.assertEqual(left["end"], right["start"])
 

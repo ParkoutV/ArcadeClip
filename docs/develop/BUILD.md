@@ -1,5 +1,8 @@
 # Windows 배포본 만들기
 
+AMD64/ARM64 통합 설치 파일은 [Windows 빌드 안내](WINDOWS.md)를 따르세요.
+아래는 기존 Nuitka 배포 경로에 대한 설명입니다.
+
 `dist/ArcadeClip.dist/` 폴더에 `ArcadeClip.exe`와 실행에 필요한 파일을 함께 만듭니다. 진단 로그를 남기며 실행하는 `ArcadeClip_dbg.cmd` 실행 파일도 같이 만듭니다. 배포할 때는 이 폴더 전체를 전달합니다.
 
 ## 만들기 전에

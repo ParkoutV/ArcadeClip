@@ -2,6 +2,8 @@
 from i18n import tr
 from concurrent.futures import CancelledError
 from time import perf_counter
+from contextlib import ExitStack
+import gc
 import av
 from media import oriented_image
 from analysis_common import check_cancel
@@ -24,12 +26,32 @@ def clamp_analysis_end(path, start, end):
 
 
 def samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=None, gpu=False,
-            region=None, reference_size=None, on_frame=None):
+            region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
+    try:
+        yield from _samples(path, start, end, interval, cancel, decoder_threads=decoder_threads,
+                            metrics=metrics, gpu=gpu, region=region,
+                            reference_size=reference_size, on_frame=on_frame,
+                            gpu_convert=gpu_convert, pipelined=pipelined)
+    finally:
+        # After generator frames unwind, reclaim metadata cycles. Live frames
+        # deliberately retained by a reference consumer remain reachable.
+        gc.collect()
+
+
+def _samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=None, gpu=False,
+             region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
+    gpu_convert = gpu if gpu_convert is None else gpu_convert
     hardware = None
     if gpu:
         from av.codec.hwaccel import HWAccel
-        hardware = HWAccel("d3d11va", allow_software_fallback=False)
-    with av.open(str(path), **({"hwaccel": hardware} if hardware else {})) as container:
+        hardware = HWAccel("d3d11va", allow_software_fallback=False, is_hw_owned=True)
+    with ExitStack() as resources:
+        converter = None
+        if gpu_convert:
+            from gpu_image import GPUImageConverter
+            converter = GPUImageConverter()
+            resources.callback(converter.close)
+        container = resources.enter_context(av.open(str(path), **({"hwaccel": hardware} if hardware else {})))
         if not container.streams.video:
             raise ValueError(tr('영상 스트림을 찾을 수 없습니다.'))
         stream = container.streams.video[0]
@@ -42,6 +64,29 @@ def samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=No
         if start >= end:
             return
         container.seek(origin + int(start / stream.time_base), stream=stream, backward=True)
+        selected = _selected(container, stream, origin, start, end, interval, cancel, metrics, on_frame)
+        if pipelined:
+            from pipeline import prefetch
+            selected = prefetch(selected, cancel, capacity=2)
+        resources.callback(selected.close)
+        for seconds, frame in selected:
+            began = perf_counter()
+            if converter:
+                image = converter.convert(frame, region=region, reference_size=reference_size)
+            else:
+                if frame.format.name == 'd3d11':
+                    frame = frame.reformat(format='nv12')
+                image = oriented_image(frame, region=region, reference_size=reference_size)
+            if metrics is not None:
+                metrics['convert_s'] += perf_counter() - began
+                metrics['sample_frames'] += 1
+                metrics['converter'] = 'GPU · D3D11 ROI→RGB' if converter else 'CPU'
+            frame = None
+            yield seconds, image
+            del image
+
+
+def _selected(container, stream, origin, start, end, interval, cancel, metrics, on_frame):
         target = start
         iterator = iter(container.decode(stream))
         while True:
@@ -58,6 +103,7 @@ def samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=No
             if metrics is not None:
                 metrics["decoder"] = "GPU · D3D11VA" if stream.codec_context.is_hwaccel else "CPU"
             if frame.pts is None:
+                frame = None
                 continue
             seconds = float((frame.pts - origin) * stream.time_base)
             if seconds >= end:
@@ -65,24 +111,22 @@ def samples(path, start, end, interval, cancel, *, decoder_threads=1, metrics=No
             if on_frame is not None:
                 on_frame(seconds, frame)
             if seconds + 1e-7 < target:
+                frame = None
                 continue
-            began = perf_counter()
-            image = oriented_image(frame, region=region, reference_size=reference_size)
-            if metrics is not None:
-                metrics["convert_s"] += perf_counter() - began
-                metrics["sample_frames"] += 1
-            yield seconds, image
+            yield seconds, frame
+            frame = None
             target = seconds + interval
 
 
 def analysis_samples(path, start, end, interval, cancel, threads, metrics, gpu, report, warnings,
-                     *, region=None, reference_size=None, on_frame=None):
+                     *, region=None, reference_size=None, on_frame=None, gpu_convert=None, pipelined=False):
     # Resume at the next sampling target if the experimental decoder fails mid-stream.
     resume = start
-    if gpu:
+    if gpu or gpu_convert:
         try:
             for seconds, image in samples(path, start, end, interval, cancel,
-                                          decoder_threads=threads, metrics=metrics, gpu=True,
+                                          decoder_threads=threads, metrics=metrics, gpu=gpu,
+                                          gpu_convert=gpu_convert, pipelined=pipelined,
                                           region=region, reference_size=reference_size, on_frame=on_frame):
                 resume = seconds + interval
                 yield seconds, image
@@ -90,8 +134,8 @@ def analysis_samples(path, start, end, interval, cancel, threads, metrics, gpu, 
         except CancelledError:
             raise
         except (av.FFmpegError, RuntimeError, ValueError, NotImplementedError) as error:
-            message = tr('GPU 디코딩을 사용할 수 없어 CPU로 계속합니다: {error}', error=error)
+            message = tr('GPU 처리를 사용할 수 없어 CPU로 계속합니다: {error}', error=error)
             warnings.append(message)
             report(message)
     yield from samples(path, resume, end, interval, cancel, decoder_threads=threads, metrics=metrics,
-                       region=region, reference_size=reference_size, on_frame=on_frame)
+                       region=region, reference_size=reference_size, on_frame=on_frame, pipelined=pipelined)

@@ -6,12 +6,12 @@ from uuid import uuid4
 import json
 import zipfile
 
-from PySide6.QtCore import Qt, Signal, QUrl, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, Signal, QUrl, QVariantAnimation, QEasingCurve, QTimer
 from PySide6.QtGui import QPixmap, QIcon
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from preview import VideoCanvas
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QInputDialog, QMessageBox, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget, QDialogButtonBox,
 )
 
@@ -78,6 +78,7 @@ class ProfilePanel(QWidget):
         self.guide_prompt.setStyleSheet("background:#18232b;color:white;border-radius:6px;font-size:15px;padding:12px;")
         layout.addWidget(self.guide_prompt)
         self.guide_video = VideoCanvas()
+        self.guide_video.enable_video()
         self.guide_video.setEnabled(False)
         self.guide_video.setMinimumSize(240, 135)
         self.guide_video.setMaximumHeight(200)
@@ -86,9 +87,9 @@ class ProfilePanel(QWidget):
         self.guide_pause.clicked.connect(self.toggle_guide)
         layout.addWidget(self.guide_pause)
         self.guide_player = QMediaPlayer(self)
-        self.guide_sink = QVideoSink(self)
+        self.guide_sink = self.guide_video.video_sink or QVideoSink(self)
         self.guide_sink.videoFrameChanged.connect(
-            lambda frame: self.guide_video.set_image(frame.toImage()) if frame.isValid() else None)
+            lambda frame: self.guide_video.set_frame(frame) if frame.isValid() else None)
         self.guide_player.setVideoSink(self.guide_sink)
         self.guide_player.setLoops(QMediaPlayer.Loops.Infinite)
         self.guide_player.errorOccurred.connect(lambda error, text: self.guide_title.setText(tr('가이드 재생 오류: ') + text))
@@ -110,7 +111,12 @@ class ProfilePanel(QWidget):
                 row.addWidget(button)
             layout.addLayout(row)
         self.preview.regionChanged.connect(self.region_edited)
-        self.preview.frameChanged.connect(self.update_crop)
+        self.crop_timer = QTimer(self)
+        self.crop_timer.setSingleShot(True)
+        self.crop_timer.setInterval(150)
+        self.crop_timer.timeout.connect(self.update_crop)
+        self.preview.frameChanged.connect(self.schedule_crop)
+        self.preview.player.playbackStateChanged.connect(self.crop_playback_changed)
         self.update_crop()
 
     def update_guide(self):
@@ -147,12 +153,21 @@ class ProfilePanel(QWidget):
         super().showEvent(event)
         self.refresh_profiles()
         self.update_guide()
+        self.update_crop()
 
     def hideEvent(self, event):
+        self.crop_timer.stop()
         self.guide_player.stop()
         self.kind_pulse.stop()
         self.kind.setStyleSheet("")
         super().hideEvent(event)
+
+    def release(self):
+        self.crop_timer.stop()
+        self.guide_player.stop()
+        self.guide_player.setVideoSink(None)
+        self.guide_player.setSource(QUrl())
+        self.guide_video.release()
 
     def change_region(self):
         self.update_guide()
@@ -160,12 +175,25 @@ class ProfilePanel(QWidget):
         self.update_crop()
 
     def region_edited(self, *args):
-        image = self.preview.canvas.image
-        if not image.isNull():
-            self.profile_size = [image.width(), image.height()]
+        size = self.preview.canvas.image_size
+        if not size.isEmpty():
+            self.profile_size = [size.width(), size.height()]
         self.update_crop()
 
+    def schedule_crop(self):
+        if not self.isVisible():
+            return
+        if not self.preview.player.isPlaying():
+            self.update_crop()
+        elif not self.crop_timer.isActive():
+            self.crop_timer.start()
+
+    def crop_playback_changed(self, state):
+        if state != QMediaPlayer.PlaybackState.PlayingState:
+            self.update_crop()
+
     def update_crop(self):
+        self.crop_timer.stop()
         offset = self.jacket_offset
         roi = self.preview.regions.get("jacket")
         self.preview.canvas.offset_box = None
@@ -175,11 +203,11 @@ class ProfilePanel(QWidget):
             self.preview.canvas.offset_box = [x0 + a * (x1-x0), y0 + b * (y1-y0),
                                               x0 + c * (x1-x0), y0 + d * (y1-y0)]
         self.preview.canvas.update()
-        image = self.preview.canvas.image
-        if image.isNull():
+        dimensions = self.preview.canvas.image_size
+        if dimensions.isEmpty():
             self.crop.clear()
             return
-        size = [image.width(), image.height()]
+        size = [dimensions.width(), dimensions.height()]
         if self.profile_size and abs(size[0] / size[1] - self.profile_size[0] / self.profile_size[1]) > .01:
             self.preview.set_regions({})
             self.profile_size = None
@@ -188,6 +216,9 @@ class ProfilePanel(QWidget):
         if not box:
             self.crop.clear()
             return
+        if not self.isVisible():
+            return
+        image = self.preview.canvas.image
         x0, y0, x1, y1 = box
         cropped = image.copy(round(x0 * size[0]), round(y0 * size[1]),
                              round((x1 - x0) * size[0]), round((y1 - y0) * size[1]))
@@ -205,15 +236,15 @@ class ProfilePanel(QWidget):
 
     def edit_coordinates(self):
         key = self.kind.currentData()
-        image = self.preview.canvas.image
-        if not key or image.isNull():
+        size = self.preview.canvas.image_size
+        if not key or size.isEmpty():
             return
         self.preview.player.pause()
         dialog = QDialog(self)
         dialog.setWindowTitle(tr('{region} 영역 좌표', region=REGIONS[key]))
         layout = QFormLayout(dialog)
         box = self.preview.regions.get(key, [0, 0, 1, 1])
-        dimensions = [image.width(), image.height()] * 2
+        dimensions = [size.width(), size.height()] * 2
         fields = []
         for label, value, maximum in zip((tr('왼쪽'), tr('위'), tr('오른쪽'), tr('아래')), box, dimensions):
             field = QSpinBox()
@@ -240,8 +271,8 @@ class ProfilePanel(QWidget):
     def current_profile(self, require_complete=False):
         if require_complete:
             require_regions(self.preview.regions)
-        image = self.preview.canvas.image
-        size = self.profile_size if image.isNull() else [image.width(), image.height()]
+        dimensions = self.preview.canvas.image_size
+        size = self.profile_size if dimensions.isEmpty() else [dimensions.width(), dimensions.height()]
         return validate_profile({**({"jacket_offset": self.jacket_offset} if self.jacket_offset else {}),
                                  "version": 1, "name": self.name.text(),
                                  "size": size, "regions": self.preview.regions,
@@ -446,9 +477,17 @@ class ProfilePanel(QWidget):
             (text_form if key == "ocr_tail_seconds" else jacket_form).addRow(label, field)
             fields[key] = field
 
+        freeplay = QCheckBox(tr('Free Play: 달성률 초기화로 같은 곡 재시작 구분'))
+        freeplay.setObjectName("freeplay_resets")
+        freeplay.setChecked(options.get("freeplay_resets", False))
+        freeplay.setToolTip(tr('1P 달성률의 0%·101% 초기화를 확인합니다. 플레이 중 달성률 영역을 지정하세요. 추가 OCR로 분석 시간이 늘어납니다.'))
+        text_form.addRow(freeplay)
+
         def keep():
             self.recognition_options = {key: field.value() for key, field in fields.items()}
+            self.recognition_options["freeplay_resets"] = freeplay.isChecked()
 
+        freeplay.toggled.connect(keep)
         for field in fields.values():
             field.valueChanged.connect(keep)
         jacket_hint = QLabel(tr('곡 확인 간격이 짧을수록 더 자주 확인합니다.\n자켓 차이 허용값을 높이면 더 느슨하게 인식합니다.\n두 후보의 최소 점수 차이를 높이면 비슷한 자켓을 더 엄격하게 구분합니다.'))

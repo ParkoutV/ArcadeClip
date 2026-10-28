@@ -1,5 +1,12 @@
 # ArcadeClip
 
+이 저장소는 [151net/ArcadeClip](https://github.com/151net/ArcadeClip)의 포크입니다.
+로컬에서 작업한 인식·미리보기·GPU 분석·스트림 수신 개선을 포함하며,
+AMD64/ARM64 겸용 설치 파일은 Windows 아키텍처를 자동으로 판별합니다.
+설치 중 Python과 FFmpeg를 각각 내장하거나 호환되는 로컬 설치를 선택할 수 있습니다.
+PATH에서 호환되는 도구를 찾으면 로컬 사용을 권장합니다.
+빌드 방법과 호환 조건은 [Windows 빌드 안내](docs/develop/WINDOWS.md)를 참고하세요.
+
 <img src="src/assets/icon.png" alt="" width="104" align="left" style="padding-right: 01em;">
 
 maimai 플레이를 길게 녹화한 영상에서 곡을 찾아, 곡별 MP4 파일로 분할 저장하는 Windows 앱입니다.
@@ -68,7 +75,8 @@ maimai 플레이를 길게 녹화한 영상에서 곡을 찾아, 곡별 MP4 파�
 
 ## 실행 환경
 
-Windows 10·11 x64에서 사용하세요. 다른 운영체제용 배포본은 아직 제공하지 않습니다.
+Windows 10·11 AMD64 또는 Windows 11 ARM64에서 사용하세요.
+ARM64에서는 격리된 x64 OCR 런타임을 위해 Windows의 x64 에뮬레이션을 사용합니다.
 
 ## 소스에서 실행하기
 

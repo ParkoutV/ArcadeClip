@@ -17,7 +17,8 @@ from video_sampling import clamp_analysis_end
 
 
 def analyze(path, start, end, profile, directory, cancel, report, *, workers=0,
-            decoder_threads=0, ocr_workers=0, gpu=False, recognizer=None):
+            decoder_threads=0, ocr_workers=0, gpu=False, recognizer=None,
+            gpu_convert=None, pipelined=False):
     if recognizer is None:
         import jacket_recognition as recognizer
     profile = validate_profile(profile)
@@ -29,8 +30,13 @@ def analyze(path, start, end, profile, directory, cancel, report, *, workers=0,
     try:
         check_cancel(cancel)
         end = clamp_analysis_end(path, start, end)
+        extra = {}
+        if gpu_convert is not None:
+            extra['gpu_convert'] = gpu_convert
+        if pipelined:
+            extra['pipelined'] = True
         detected = recognizer.detect(path, start, end, profile, directory, cancel, report,
-                                     workers=workers, decoder_threads=decoder_threads, gpu=gpu)
+                                     workers=workers, decoder_threads=decoder_threads, gpu=gpu, **extra)
         profile = validate_profile(detected.get("profile", profile))
         result.update(profile=profile, warnings=list(detected.get("warnings", [])))
         if "scan_metrics" in detected:

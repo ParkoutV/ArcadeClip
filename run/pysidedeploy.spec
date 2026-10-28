@@ -11,9 +11,9 @@ python_path =
 packages = Nuitka==4.2.1
 
 [qt]
-qml_files =
+qml_files = src/assets/preview.qml
 excluded_qml_plugins =
-modules = Core,Gui,Widgets,Multimedia
+modules = Core,Gui,Widgets,Multimedia,Qml,Quick,QuickWidgets
 plugins = platforms,multimedia
 
 [nuitka]

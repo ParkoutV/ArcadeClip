@@ -53,9 +53,17 @@ def youtube_url(value: str) -> str:
 
 
 def find_tool(name: str) -> str:
+    from runtime_config import configured_tool
+    selected = configured_tool(name)
+    if selected:
+        return selected
     filename = name + (".exe" if os.name == "nt" else "")
-    for root in (Path(sys.executable).parent, Path(__file__).resolve().parent,
-                 Path(__file__).resolve().parent.parent):
+    roots = [Path(sys.executable).parent, Path(__file__).resolve().parent,
+             Path(__file__).resolve().parent.parent]
+    embedded_root = Path(sys.executable).parent.parent
+    if any((embedded_root / name).is_file() for name in ('portable-runtime.json', 'arm64-portable.json')):
+        roots.append(embedded_root)
+    for root in roots:
         candidate = root / "tools" / filename
         if candidate.is_file():
             return str(candidate)
@@ -225,6 +233,9 @@ def download_progress(seconds, report, step=2):
 def _command() -> list[str]:
     command = ([sys.executable, "--yt-dlp"] if getattr(sys, "frozen", False) or "__compiled__" in globals()
                else [sys.executable, "-m", "yt_dlp"])
+    root = Path(__file__).resolve().parent.parent
+    if (root / 'portable-runtime.json').is_file():
+        command = [sys.executable, '-I', str(root / 'start.py'), '--yt-dlp']
     return command + ["--ignore-config", "--no-playlist", "--no-warnings",
                       "--socket-timeout", "20", "--retries", "2",
                       "--js-runtimes", "deno:" + find_tool("deno")]

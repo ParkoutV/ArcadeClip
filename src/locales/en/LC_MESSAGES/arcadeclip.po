@@ -2855,3 +2855,413 @@ msgstr "A video processing tool could not finish the task. Check the error in Se
 
 msgid "인증서를 다시 확인하고 있습니다. 앱에 포함된 인증서로 한 번 더 연결합니다."
 msgstr "Checking certificates again. Retrying once with the certificates included in the app."
+
+msgid "Free Play 보정에는 플레이 중 1P 달성률 영역이 필요합니다."
+msgstr "Free Play correction requires the in-play 1P achievement region."
+
+msgid "Free Play 보정 준비 실패: {error}"
+msgstr "Could not prepare Free Play correction: {error}"
+
+msgid "Free Play 보정 실패: {error}"
+msgstr "Free Play correction failed: {error}"
+
+msgid "Free Play: 달성률 초기화로 같은 곡 재시작 구분"
+msgstr "Free Play: split repeated songs when achievement resets"
+
+msgid "1P 달성률의 0%·101% 초기화를 확인합니다. 플레이 중 달성률 영역을 지정하세요. 추가 OCR로 분석 시간이 늘어납니다."
+msgstr "Check 1P achievement resets to 0% or 101%. Select the in-play achievement region. Additional OCR increases analysis time."
+
+msgid "GPU·겹쳐 처리 옵션은 3번 인식 영역 화면에서 변경합니다."
+msgstr "Change GPU and pipelined processing options on step 3 (Recognition regions)."
+
+msgid "GPU 처리를 사용할 수 없어 CPU로 계속합니다: {error}"
+msgstr "GPU processing is unavailable; continuing on CPU: {error}"
+
+msgid "GPU 영상 디코딩"
+msgstr "GPU video decoding"
+
+msgid "실험용 D3D11VA 디코딩. 지원하지 않으면 CPU로 복귀합니다."
+msgstr "Experimental D3D11VA decoding. Falls back to CPU when unsupported."
+
+msgid "GPU 이미지 변환"
+msgstr "GPU image conversion"
+
+msgid "선택된 프레임의 영역·색상 변환에 GPU를 사용합니다."
+msgstr "Use the GPU for region cropping and color conversion of sampled frames."
+
+msgid "디코딩·변환·판독 겹쳐 처리"
+msgstr "Overlap decoding, conversion, and recognition"
+
+msgid "대기 프레임 수를 제한합니다. 기존 CPU 경계 버퍼 사용 시 순차 처리합니다."
+msgstr "Bounds queued frames. Runs sequentially when the CPU boundary buffer is active."
+
+msgid "스트림 키를 복사했습니다."
+msgstr "Copied the stream key."
+
+msgid "OBS 서버 주소를 복사했습니다."
+msgstr "Copied the OBS server URL."
+
+msgid "새 스트림 키를 발급했습니다."
+msgstr "Generated a new stream key."
+
+msgid "포트포워딩 · 고정 DDNS 가이드"
+msgstr "Port forwarding & static DDNS guide"
+
+msgid "안내문 복사"
+msgstr "Copy guide"
+
+msgid "고정 주소(DDNS 또는 IP)와 스트림 키 형식을 확인해 주세요."
+msgstr "Check the static address (DDNS or IP) and stream key format."
+
+msgid "스트림 자동 저장 및 클립 {count:,}개 추출 완료"
+msgstr "Saved stream and automatically exported {count:,} clips"
+
+msgid "스트림 자동 저장 완료: {name}"
+msgstr "Saved stream automatically: {name}"
+
+msgid ""
+"[선택지 A · 직접 스트림 수신을 위한 포트포워딩 및 고정 DDNS 가이드]\n\n"
+"외부망(오락실 PC)에서 이 PC로 직접 스트림을 보내려면 공유기 포트포워딩과 고정 DDNS 주소가 필요합니다.\n"
+"(만약 공유기 설정이 어려운 휴대용 핫스팟 환경이라면 [방식 B: YouTube 라이브 자동 감지]를 선택하세요.)\n\n"
+"■ 현재 이 PC의 네트워크 정보\n"
+"• 내부 IP 주소 (포트포워딩 대상): {lan_ip}\n"
+"• 개방할 프로토콜 및 포트: {transport} {port}번\n\n"
+"■ STEP 1. 고정 DDNS 주소 발급 (공인 IP가 바뀌어도 주소 고정)\n"
+"1) ipTIME 공유기 사용 시:\n"
+"   • 브라우저에서 http://192.168.0.1 접속 → [고급 설정] → [특수기능] → [DDNS 설정]\n"
+"   • 호스트 이름(예: myarcade.iptime.org)과 사용자 ID(이메일) 입력 후 [추가] 클릭\n"
+"2) 통신사 공유기(KT·SKB·LGU+) 또는 일반 공유기 사용 시:\n"
+"   • 무료 DDNS 서비스인 DuckDNS(https://www.duckdns.org) 또는 No-IP에서 무료 도메인 발급\n"
+"   • 발급받은 도메인 주소를 이 프로그램의 [고정 주소 (DDNS/IP)] 칸에 입력\n\n"
+"■ STEP 2. 공유기 포트포워딩 설정\n"
+"1) 공유기 설정 페이지 접속 → [고급 설정] → [NAT/라우터 관리] → [포트포워드 설정]\n"
+"2) 새 규칙 추가:\n"
+"   • 내부 IP 주소: {lan_ip}\n"
+"   • 프로토콜: {transport}\n"
+"   • 외부 포트: {port} ~ {port} / 내부 포트: {port} ~ {port}\n\n"
+"■ STEP 3. 오락실 OBS (추가 스트림) 입력값\n"
+"• 서버(Server): {server_url}\n"
+"• 스트림 키(Stream Key): {key}\n"
+"• 한 번만 등록해 두면 오락실에서 스트림 소스를 켜고 끌 때마다 자동으로 원본 저장 및 클립 추출이 진행됩니다."
+msgstr ""
+"[Option A · Port Forwarding and Static DDNS Guide for Direct Stream Ingest]\n\n"
+"Receiving a stream directly from an external network (arcade PC) requires router port forwarding and a static DDNS address.\n"
+"(If you are on a mobile hotspot where router setup is unavailable, choose [Option B: YouTube Live Auto-Watch].)\n\n"
+"■ Network Information for This PC\n"
+"• Internal LAN IP (port forwarding target): {lan_ip}\n"
+"• Protocol and port to open: {transport} port {port}\n\n"
+"■ STEP 1. Get a Static DDNS Address (Keep the same address when public IP changes)\n"
+"1) ipTIME routers:\n"
+"   • Open http://192.168.0.1 in a browser → [Advanced] → [Special Features] → [DDNS Settings]\n"
+"   • Enter a hostname (e.g. myarcade.iptime.org) and user ID (email), then click [Add]\n"
+"2) ISP or other routers:\n"
+"   • Register a free domain with DuckDNS (https://www.duckdns.org) or No-IP\n"
+"   • Enter that domain into the [Static address (DDNS/IP)] field in this app\n\n"
+"■ STEP 2. Configure Router Port Forwarding\n"
+"1) Open your router admin page → [Advanced] → [NAT/Router] → [Port Forwarding]\n"
+"2) Add a new rule:\n"
+"   • Internal IP address: {lan_ip}\n"
+"   • Protocol: {transport}\n"
+"   • External port: {port} ~ {port} / Internal port: {port} ~ {port}\n\n"
+"■ STEP 3. Arcade OBS (Extra Stream) Settings\n"
+"• Server: {server_url}\n"
+"• Stream Key: {key}\n"
+"• Once registered, toggling the stream source on and off at the arcade automatically saves the recording and exports clips."
+
+msgid "YouTube 라이브 또는 채널 주소(@핸들/live)를 입력해 주세요."
+msgstr "Enter a YouTube live URL or channel live address (@handle/live)."
+
+msgid "스트림 키는 영문·숫자·하이픈(-)으로 4–64자를 입력해 주세요."
+msgstr "Enter a stream key of 4–64 letters, digits, or hyphens (-)."
+
+msgid "고정 주소(DDNS 또는 IP) 형식을 확인해 주세요."
+msgstr "Check the static address (DDNS or IP) format."
+
+msgid "지원하지 않는 스트림 프로토콜입니다."
+msgstr "Unsupported stream protocol."
+
+msgid "포트 번호는 1–65535 사이로 지정해 주세요."
+msgstr "Choose a port number between 1 and 65535."
+
+msgid "재연결 대기 시간은 0–600초 사이로 지정해 주세요."
+msgstr "Choose a reconnect grace period between 0 and 600 seconds."
+
+msgid "OBS 스트림 수신 대기 중 · {url} (스트림 키: {key})"
+msgstr "Waiting for OBS stream · {url} (stream key: {key})"
+
+msgid "OBS 스트림 저장 완료 · {path}"
+msgstr "OBS stream saved · {path}"
+
+msgid "감지 주기는 1–300초 사이로 지정해 주세요."
+msgstr "Choose a polling interval between 1 and 300 seconds."
+
+msgid "YouTube 스트림 상태를 확인하고 있습니다…"
+msgstr "Checking YouTube stream status…"
+
+msgid "방송 시작 대기 중 · {seconds:g}초 후 다시 확인합니다…"
+msgstr "Waiting for broadcast to start · checking again in {seconds:g}s…"
+
+msgid "스트림 신호 끊김 · {seconds}초 동안 재연결을 대기합니다 (LTE 일시 끊김 보호)…"
+msgstr "Stream signal interrupted · waiting {seconds}s for reconnect (LTE drop protection)…"
+
+msgid "재연결된 스트림 조각 {count}개를 하나로 합치고 있습니다…"
+msgstr "Merging {count} reconnected stream segments into one recording…"
+
+msgid "수신한 스트림 영상의 길이를 확인할 수 없습니다."
+msgstr "Could not determine the duration of the received stream recording."
+
+msgid "진행 중인 YouTube 라이브 방송을 찾지 못했습니다."
+msgstr "Could not find an active YouTube live broadcast."
+
+msgid "스트림 연결을 확인하지 못했습니다. 포트포워딩과 스트림 키를 확인해 주세요."
+msgstr "Could not verify an incoming stream connection. Check port forwarding and the stream key."
+
+msgid "OBS 스트림 수신 및 자동 저장 중 · {elapsed:.1f}초"
+msgstr "Receiving and saving OBS stream · {elapsed:.1f}s"
+
+msgid "라이브 감지됨: {title} · 현재 {seconds:.1f}초 · 송출 종료 시 자동 다운로드합니다."
+msgstr "Live broadcast detected: {title} · {seconds:.1f}s elapsed · will download automatically when stream ends."
+
+msgid "OBS 스트림 자동 클립"
+msgstr "OBS stream auto-clip"
+
+msgid "선택지 A · 직접 수신 (RTMP/SRT)"
+msgstr "Option A · Direct ingest (RTMP/SRT)"
+
+msgid "선택지 B · YouTube 라이브 자동 감지"
+msgstr "Option B · YouTube live auto-watch"
+
+msgid "RTMP (1935 · 기본)"
+msgstr "RTMP (1935 · default)"
+
+msgid "SRT (9000 · LTE 끊김 방어)"
+msgstr "SRT (9000 · LTE drop protection)"
+
+msgid "키 복사"
+msgstr "Copy key"
+
+msgid "재발급"
+msgstr "Regenerate"
+
+msgid "서버 복사"
+msgstr "Copy server"
+
+msgid "프로토콜"
+msgstr "Protocol"
+
+msgid "수신 포트"
+msgstr "Listen port"
+
+msgid "고정 주소 (DDNS/IP)"
+msgstr "Static address (DDNS/IP)"
+
+msgid "LTE 재연결 대기"
+msgstr "LTE reconnect wait"
+
+msgid "스트림 키"
+msgstr "Stream key"
+
+msgid "OBS 서버 주소"
+msgstr "OBS server URL"
+
+msgid "송출 종료 시 전체 구간 다운로드"
+msgstr "Download full range when broadcast ends"
+
+msgid "감시 주소"
+msgstr "Watch URL"
+
+msgid "감지 주기"
+msgstr "Check interval"
+
+msgid "수신 후 자동으로 곡 분석 및 클립 저장"
+msgstr "Analyze songs and export clips automatically after receiving"
+
+msgid "스트림 자동 수신 시작"
+msgstr "Start automatic stream ingest"
+
+msgid "개별 라이브 녹화 시작"
+msgstr "Start individual live recording"
+
+msgid "링크 붙여넣기"
+msgstr "Paste link"
+
+msgid "시작~정지 누른 구간만 부분 녹화 (개별 라이브용)"
+msgstr "Record only the Start-to-Stop interval (for individual live streams)"
+
+msgid "수신 정지 · 클립 생성"
+msgstr "Stop ingest & create clips"
+
+msgid "클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다."
+msgstr "No valid YouTube live or channel URL found in the clipboard."
+
+msgid "개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작]과 [수신 정지 · 클립 생성]으로 원하는 구간을 녹화할 수 있습니다."
+msgstr "Pasted individual YouTube live link. Use [Start individual live recording] and [Stop ingest & create clips] to record your desired section."
+
+msgid "YouTube 채널 라이브 주소를 붙여넣었습니다."
+msgstr "Pasted YouTube channel live URL."
+
+msgid "수신을 정지하고 현재까지 녹화된 구간으로 클립 생성을 시작합니다…"
+msgstr "Stopping ingest and starting clip generation from the recorded section…"
+
+msgid "수신된 스트림 영상이 없어 작업을 종료했습니다."
+msgstr "Ended because no stream video was received."
+
+msgid "수신 정지 요청됨 · 현재 시점까지의 라이브 구간을 다운로드합니다…"
+msgstr "Stop requested · downloading the live section up to the current point…"
+
+msgid "라이브 녹화 추적 중: {title} · 구간 {start:.1f}초 ~ {seconds:.1f}초 · [수신 정지] 또는 방송 종료 시 클립을 생성합니다."
+msgstr "Tracking live recording: {title} · {start:.1f}s ~ {seconds:.1f}s · clips will be generated on [Stop ingest] or broadcast end."
+
+msgid "수신된 YouTube 라이브 구간이 없어 작업을 종료했습니다."
+msgstr "Ended because no YouTube live section was received."
+
+msgid "설치 파일(.exe/.zip)로 업데이트…"
+msgstr "Update from file (.exe/.zip)…"
+
+msgid "업데이트 설치 프로그램을 실행했습니다. 잠시 후 앱이 자동으로 종료됩니다."
+msgstr "Launched the update installer. The app will close automatically shortly."
+
+msgid "업데이트 실행 실패"
+msgstr "Failed to launch update"
+
+msgid "설치 파일을 실행하지 못했습니다. 파일을 직접 실행해 주세요: {path}"
+msgstr "Could not launch the installer. Please run it directly: {path}"
+
+msgid "업데이트 다운로드 실패: {error}"
+msgstr "Update download failed: {error}"
+
+msgid "업데이트 파일 선택"
+msgstr "Select update file"
+
+msgid "업데이트 파일 (*setup*.exe *.exe *.zip);;모든 파일 (*)"
+msgstr "Update files (*setup*.exe *.exe *.zip);;All files (*)"
+
+msgid "업데이트 실패"
+msgstr "Update failed"
+
+msgid "인플레이스 업데이트 설치"
+msgstr "In-place update installation"
+
+msgid "현재 작업 상태를 저장하고 선택한 설치 파일로 덮어쓰기 업데이트를 진행할까요?\n(사용자 데이터·프로필·클립은 그대로 유지됩니다)"
+msgstr "Save current work and proceed with an in-place update using the selected installer?\n(Your data, profiles, and clips will be preserved)"
+
+msgid "소스 파일 {count}개를 업데이트했습니다. 재시작하면 적용됩니다."
+msgstr "Updated {count} source files. Restart the app to apply changes."
+
+msgid "업데이트 완료"
+msgstr "Update complete"
+
+msgid "파일 {count}개를 업데이트했습니다. 지금 앱을 다시 시작할까요?"
+msgstr "Updated {count} files. Restart the app now?"
+
+msgid "새 버전 {name}이 있습니다. 어떻게 업데이트할까요?"
+msgstr "New version {name} is available. How would you like to update?"
+
+msgid "자동 다운로드 및 업데이트 설치"
+msgstr "Download and install update automatically"
+
+msgid "릴리스 페이지 열기"
+msgstr "Open releases page"
+
+msgid "유효한 HTTPS 설치 파일(.exe) 주소가 아닙니다."
+msgstr "Not a valid HTTPS installer (.exe) URL."
+
+msgid "설치 파일 크기가 허용 한도를 초과했습니다."
+msgstr "Installer file size exceeded the allowed limit."
+
+msgid "업데이트 설치 파일 다운로드 중 · {percent}% ({mb:.1f} MB)"
+msgstr "Downloading update installer · {percent}% ({mb:.1f} MB)"
+
+msgid "다운로드한 파일이 올바른 Windows 실행 파일(.exe)이 아닙니다."
+msgstr "Downloaded file is not a valid Windows executable (.exe)."
+
+msgid "다운로드한 설치 파일의 무결성(SHA-256) 검증에 실패했습니다."
+msgstr "Integrity check (SHA-256) failed for the downloaded installer."
+
+msgid "선택한 업데이트 파일을 찾을 수 없습니다."
+msgstr "Could not find the selected update file."
+
+msgid "올바른 Windows 설치 실행 파일(.exe)이 아닙니다."
+msgstr "Not a valid Windows setup executable (.exe)."
+
+msgid "앱 소스 폴더(src)를 찾을 수 없어 압축 업데이트를 적용할 수 없습니다."
+msgstr "Cannot apply ZIP update because the app source folder (src) was not found."
+
+msgid "손상된 ZIP 업데이트 파일입니다."
+msgstr "The ZIP update file is corrupted."
+
+msgid "안전하지 않은 경로가 포함된 압축 파일입니다."
+msgstr "The ZIP archive contains an unsafe file path."
+
+msgid "압축 파일에서 업데이트할 소스 항목을 찾지 못했습니다."
+msgstr "No updatable source entries were found in the ZIP archive."
+
+msgid "지원하는 업데이트 형식(.exe 설치 파일 또는 .zip 패키지)을 선택해 주세요."
+msgstr "Please select a supported update format (.exe installer or .zip package)."
+
+
+
+
+msgid "스트림 연결이 끊겼습니다. 저장된 영상은 유지하고 재연결을 확인합니다."
+msgstr "Stream disconnected. Keeping recorded media and checking for reconnection."
+
+msgid "개별 라이브 방송 정보를 확인할 수 없습니다."
+msgstr "Could not identify an individual live broadcast."
+
+msgid "실시간 수신 가능한 HLS 영상 형식을 찾지 못했습니다."
+msgstr "No HLS video format is available for live capture."
+
+msgid "YouTube 라이브 연결을 확인하고 있습니다…"
+msgstr "Checking the YouTube live connection…"
+
+msgid "수신된 YouTube 라이브 영상이 없어 작업을 종료했습니다."
+msgstr "Stopped because no YouTube live video was received."
+
+msgid "영상 요청 헤더를 확인할 수 없습니다."
+msgstr "Could not validate the media request headers."
+
+msgid "재연결에 실패했습니다. 현재까지 저장된 영상으로 클립을 생성합니다."
+msgstr "Reconnection failed. Creating clips from the video recorded so far."
+
+msgid "YouTube 라이브 실시간 수신을 시작합니다. 정지하거나 방송이 종료되면 클립을 생성합니다."
+msgstr "Starting YouTube live capture. Clips will be created when you stop capture or the broadcast ends."
+
+msgid "라이브 연결을 다시 확인합니다. 저장된 영상은 유지됩니다."
+msgstr "Checking the live connection again. Recorded video is retained."
+
+msgid "실시간 스트림 수신 및 저장 중 · {elapsed:.1f}초"
+msgstr "Receiving and recording live stream · {elapsed:.1f}s"
+
+msgid "현재 진행 중인 YouTube 라이브 링크를 입력해 주세요."
+msgstr "Enter a YouTube link for a broadcast that is currently live."
+
+msgid "라이브 영상 수신을 시작하지 못했습니다."
+msgstr "Could not start receiving live video."
+
+msgid "연결 재확인 주기"
+msgstr "Connection check interval"
+
+msgid "방송 감지 즉시 최신 지점부터 실시간 저장합니다. 수신 정지 또는 방송 종료 후 클립을 생성합니다."
+msgstr "Records from the live edge as soon as the broadcast is detected. Creates clips after capture stops or the broadcast ends."
+
+
+msgid "방송 감지 즉시 최신 지점부터 실시간 저장합니다. 수신이 끝나면 시간 선택 및 인식 영역을 설정할 수 있습니다."
+msgstr "Records from the live edge as soon as the broadcast is detected. Once capture finishes, you can select the time range and recognition regions."
+
+msgid "미리 저장해 둔 인식 영역 프로필이 있을 때만 체크하세요. 체크를 해제하면 스트림 저장 후 [2] 시간 선택과 [3] 인식 영역을 직접 설정할 수 있습니다."
+msgstr "Check only when you already have a saved recognition profile. Leave unchecked to configure [2] Time selection and [3] Recognition regions after saving the stream."
+
+msgid "수신 정지 · 시간 선택으로"
+msgstr "Stop ingest & select time"
+
+msgid "개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작] 후 원하는 시점에 정지하면 시간 선택 및 인식 영역을 설정할 수 있습니다."
+msgstr "Pasted individual YouTube live link. Start with [Start individual live recording] and stop at any point to configure time selection and recognition regions."
+
+msgid "수신을 정지하고 녹화된 영상을 시간 선택 단계로 불러옵니다…"
+msgstr "Stopping ingest and loading the recorded video into the time selection stage…"
+
+msgid "스트림 저장 완료: {name} · 시간 선택 후 인식 영역을 지정해 주세요."
+msgstr "Stream saved: {name} · select the time range and configure recognition regions."
+
+msgid "스트림 저장 완료: {name} · 분석할 시간 구간과 인식 영역을 선택해 주세요."
+msgstr "Stream saved: {name} · choose the time range and recognition regions to analyze."

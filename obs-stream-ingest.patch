@@ -1,0 +1,3048 @@
+diff --git "a/src\\stream_ingest.py" "b/src\\stream_ingest.py"
+new file mode 100644
+index 0000000..082f404
+--- /dev/null
++++ "b/src\\stream_ingest.py"
+@@ -0,0 +1,558 @@
++"""OBS stream-key ingest (direct RTMP/SRT with LTE grace period or YouTube live watch) and auto-clipping."""
++from datetime import datetime
++import json
++import math
++import os
++from pathlib import Path
++import re
++import secrets
++import socket
++import subprocess
++import tempfile
++import threading
++import time
++from urllib.parse import urlsplit
++import uuid
++
++from i18n import tr
++from sources import (
++    _command,
++    _media_duration,
++    _stop,
++    download_section,
++    find_tool,
++    inspect_source,
++    run_command,
++    youtube_url,
++)
++from tool_errors import ToolError
++
++
++def analyze(*args, **kwargs):
++    from recognition import analyze as _analyze
++    return _analyze(*args, **kwargs)
++
++
++def export_clips(*args, **kwargs):
++    from export import export_clips as _export_clips
++    return _export_clips(*args, **kwargs)
++
++
++def generate_stream_key() -> str:
++    return "ac-" + "-".join(secrets.token_hex(2) for _ in range(3))
++
++
++def validate_stream_key(value: str) -> str:
++    if not isinstance(value, str):
++        raise ValueError(tr('스트림 키는 영문·숫자·하이픈(-)으로 4–64자를 입력해 주세요.'))
++    cleaned = value.strip()
++    if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", cleaned):
++        raise ValueError(tr('스트림 키는 영문·숫자·하이픈(-)으로 4–64자를 입력해 주세요.'))
++    return cleaned
++
++
++def validate_host(value: str) -> str:
++    if not isinstance(value, str):
++        raise ValueError(tr('고정 주소(DDNS 또는 IP) 형식을 확인해 주세요.'))
++    cleaned = value.strip()
++    if not cleaned:
++        return "127.0.0.1"
++    if (not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", cleaned)
++            or ".." in cleaned or cleaned[0] in ".-" or cleaned[-1] in ".-"):
++        raise ValueError(tr('고정 주소(DDNS 또는 IP) 형식을 확인해 주세요.'))
++    return cleaned
++
++
++def local_lan_ip() -> str:
++    try:
++        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
++            probe.connect(("8.8.8.8", 80))
++            ip = probe.getsockname()[0]
++            if ip and not ip.startswith("127."):
++                return ip
++    except OSError:
++        pass
++    return "127.0.0.1"
++
++
++def obs_connection_info(protocol: str, host: str, port: int, stream_key: str) -> dict:
++    if protocol not in ("rtmp", "srt"):
++        raise ValueError(tr('지원하지 않는 스트림 프로토콜입니다.'))
++    if type(port) is not int or not 1 <= port <= 65535:
++        raise ValueError(tr('포트 번호는 1–65535 사이로 지정해 주세요.'))
++    host = validate_host(host)
++    key = validate_stream_key(stream_key)
++    if protocol == "rtmp":
++        server_url = f"rtmp://{host}:{port}/live2"
++        listen_url = f"rtmp://0.0.0.0:{port}/live2/{key}"
++    else:
++        server_url = f"srt://{host}:{port}?streamid={key}&latency=2500000"
++        listen_url = f"srt://0.0.0.0:{port}?mode=listener&streamid={key}&latency=2500000"
++    return {
++        "protocol": protocol,
++        "host": host,
++        "port": port,
++        "stream_key": key,
++        "server_url": server_url,
++        "listen_url": listen_url,
++    }
++
++
++def port_forwarding_guide(protocol: str = "rtmp", port: int = 1935,
++                          host: str = "", stream_key: str = "") -> str:
++    lan_ip = local_lan_ip()
++    transport = "TCP" if protocol == "rtmp" else "UDP"
++    key = stream_key.strip() if isinstance(stream_key, str) and stream_key.strip() else "ac-xxxx-xxxx-xxxx"
++    display_host = host.strip() if isinstance(host, str) and host.strip() else "myarcade.iptime.org"
++    try:
++        info = obs_connection_info(protocol if protocol in ("rtmp", "srt") else "rtmp",
++                                   display_host, port if type(port) is int and 1 <= port <= 65535 else 1935, key)
++        server_url = info["server_url"]
++        key = info["stream_key"]
++    except ValueError:
++        server_url = f"rtmp://{display_host}:{port}/live2"
++    return tr(
++        '[선택지 A · 직접 스트림 수신을 위한 포트포워딩 및 고정 DDNS 가이드]\n\n'
++        '외부망(오락실 PC)에서 이 PC로 직접 스트림을 보내려면 공유기 포트포워딩과 고정 DDNS 주소가 필요합니다.\n'
++        '(만약 공유기 설정이 어려운 휴대용 핫스팟 환경이라면 [방식 B: YouTube 라이브 자동 감지]를 선택하세요.)\n\n'
++        '■ 현재 이 PC의 네트워크 정보\n'
++        '• 내부 IP 주소 (포트포워딩 대상): {lan_ip}\n'
++        '• 개방할 프로토콜 및 포트: {transport} {port}번\n\n'
++        '■ STEP 1. 고정 DDNS 주소 발급 (공인 IP가 바뀌어도 주소 고정)\n'
++        '1) ipTIME 공유기 사용 시:\n'
++        '   • 브라우저에서 http://192.168.0.1 접속 → [고급 설정] → [특수기능] → [DDNS 설정]\n'
++        '   • 호스트 이름(예: myarcade.iptime.org)과 사용자 ID(이메일) 입력 후 [추가] 클릭\n'
++        '2) 통신사 공유기(KT·SKB·LGU+) 또는 일반 공유기 사용 시:\n'
++        '   • 무료 DDNS 서비스인 DuckDNS(https://www.duckdns.org) 또는 No-IP에서 무료 도메인 발급\n'
++        '   • 발급받은 도메인 주소를 이 프로그램의 [고정 주소 (DDNS/IP)] 칸에 입력\n\n'
++        '■ STEP 2. 공유기 포트포워딩 설정\n'
++        '1) 공유기 설정 페이지 접속 → [고급 설정] → [NAT/라우터 관리] → [포트포워드 설정]\n'
++        '2) 새 규칙 추가:\n'
++        '   • 내부 IP 주소: {lan_ip}\n'
++        '   • 프로토콜: {transport}\n'
++        '   • 외부 포트: {port} ~ {port} / 내부 포트: {port} ~ {port}\n\n'
++        '■ STEP 3. 오락실 OBS (추가 스트림) 입력값\n'
++        '• 서버(Server): {server_url}\n'
++        '• 스트림 키(Stream Key): {key}\n'
++        '• 한 번만 등록해 두면 오락실에서 스트림 소스를 켜고 끌 때마다 자동으로 원본 저장 및 클립 추출이 진행됩니다.',
++        lan_ip=lan_ip,
++        transport=transport,
++        port=port,
++        server_url=server_url,
++        key=key,
++    )
++
++
++def youtube_stream_target(value: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(tr('YouTube 라이브 또는 채널 주소(@핸들/live)를 입력해 주세요.'))
++    text = value.strip()
++    if text.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_.-]{2,60}", text):
++        return f"https://www.youtube.com/{text}/live"
++    try:
++        return youtube_url(text)
++    except ValueError:
++        pass
++    try:
++        parsed = urlsplit(text)
++        if (parsed.scheme not in {"https", "http"} or parsed.username
++                or parsed.password or parsed.port not in {None, 80, 443}):
++            raise ValueError
++        host = (parsed.hostname or "").lower()
++        if host not in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
++            raise ValueError
++        parts = [part for part in parsed.path.strip("/").split("/") if part]
++        if len(parts) in (1, 2) and parts[0].startswith("@") and re.fullmatch(r"@[A-Za-z0-9_.-]{2,60}", parts[0]):
++            if len(parts) == 2 and parts[1] not in {"live", "streams"}:
++                raise ValueError
++            return f"https://www.youtube.com/{parts[0]}/live"
++        if len(parts) in (2, 3) and parts[0] == "channel" and re.fullmatch(r"UC[A-Za-z0-9_-]{20,30}", parts[1]):
++            if len(parts) == 3 and parts[2] not in {"live", "streams"}:
++                raise ValueError
++            return f"https://www.youtube.com/channel/{parts[1]}/live"
++    except (ValueError, AttributeError):
++        pass
++    raise ValueError(tr('YouTube 라이브 또는 채널 주소(@핸들/live)를 입력해 주세요.'))
++
++
++def is_individual_youtube_live_url(value: str) -> bool:
++    """Return True if value is an individual YouTube broadcast/video link rather than a channel live URL."""
++    try:
++        youtube_url(value)
++        return True
++    except ValueError:
++        return False
++
++
++def _listen_part(ffmpeg: str, info: dict, part_path: Path, cancel: threading.Event,
++                 report, *, idle_timeout: float | None = None,
++                 stop_event: threading.Event | None = None) -> bool:
++    """Listen for one incoming stream segment; return True if media bytes were recorded."""
++    if cancel.is_set():
++        raise InterruptedError(tr('작업을 취소했습니다.'))
++    if stop_event is not None and stop_event.is_set():
++        return False
++    args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2"]
++    if info["protocol"] == "rtmp":
++        args += ["-listen", "1", "-f", "flv", "-i", info["listen_url"]]
++    else:
++        args += ["-i", info["listen_url"]]
++    args += ["-c", "copy", "-f", "mpegts", str(part_path)]
++
++    options = ({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
++               if os.name == "nt" else {"start_new_session": True})
++    media_started = threading.Event()
++    with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                          stderr=subprocess.PIPE, text=True, encoding="utf-8",
++                          errors="replace", **options) as process:
++        def read_stderr():
++            for raw in process.stderr:
++                line = raw.strip()
++                if not line:
++                    continue
++                if line.startswith("out_time_us="):
++                    try:
++                        elapsed = max(0, int(line.partition("=")[2]) / 1000000)
++                    except ValueError:
++                        continue
++                    if elapsed > 0:
++                        media_started.set()
++                        report(tr('OBS 스트림 수신 및 자동 저장 중 · {elapsed:.1f}초', elapsed=elapsed))
++                elif line.startswith("total_size="):
++                    try:
++                        if int(line.partition("=")[2]) > 0:
++                            media_started.set()
++                    except ValueError:
++                        pass
++
++        reader = threading.Thread(target=read_stderr, daemon=True)
++        reader.start()
++        began = time.monotonic()
++        try:
++            while True:
++                if cancel.is_set():
++                    raise InterruptedError(tr('작업을 취소했습니다.'))
++                if part_path.is_file() and part_path.stat().st_size > 0:
++                    media_started.set()
++                if stop_event is not None and stop_event.is_set():
++                    _stop(process)
++                    reader.join()
++                    break
++                if (idle_timeout is not None and not media_started.is_set()
++                        and time.monotonic() - began >= idle_timeout):
++                    _stop(process)
++                    reader.join()
++                    return False
++                try:
++                    process.wait(timeout=0.2)
++                    break
++                except subprocess.TimeoutExpired:
++                    continue
++        except BaseException:
++            _stop(process)
++            reader.join()
++            raise
++        reader.join()
++    return part_path.is_file() and part_path.stat().st_size > 0
++
++
++def receive_direct_stream(protocol: str, port: int, stream_key: str, directory: Path,
++                          cancel: threading.Event, report, *, host: str = "127.0.0.1",
++                          grace_seconds: int = 60, max_empty_retries: int = 3,
++                          stop_event: threading.Event | None = None) -> Path:
++    """Receive an OBS stream via RTMP/SRT, coalescing LTE reconnects within grace_seconds."""
++    if type(grace_seconds) is not int or not 0 <= grace_seconds <= 600:
++        raise ValueError(tr('재연결 대기 시간은 0–600초 사이로 지정해 주세요.'))
++    info = obs_connection_info(protocol, host, port, stream_key)
++    ffmpeg = find_tool("ffmpeg")
++    directory = Path(directory)
++    directory.mkdir(parents=True, exist_ok=True)
++    with tempfile.TemporaryDirectory(prefix=".stream-", dir=directory) as temporary:
++        work = Path(temporary)
++        parts: list[Path] = []
++        empty_attempts = 0
++        report(tr('OBS 스트림 수신 대기 중 · {url} (스트림 키: {key})',
++                  url=info["server_url"], key=info["stream_key"]))
++        while not parts:
++            if cancel.is_set():
++                raise InterruptedError(tr('작업을 취소했습니다.'))
++            if stop_event is not None and stop_event.is_set():
++                raise RuntimeError(tr('수신된 스트림 영상이 없어 작업을 종료했습니다.'))
++            part = work / "part_001.ts"
++            listen_kwargs = {"stop_event": stop_event} if stop_event is not None else {}
++            if _listen_part(ffmpeg, info, part, cancel, report, **listen_kwargs):
++                parts.append(part)
++                break
++            part.unlink(missing_ok=True)
++            if stop_event is not None and stop_event.is_set():
++                raise RuntimeError(tr('수신된 스트림 영상이 없어 작업을 종료했습니다.'))
++            empty_attempts += 1
++            if max_empty_retries > 0 and empty_attempts >= max_empty_retries:
++                raise RuntimeError(tr('스트림 연결을 확인하지 못했습니다. 포트포워딩과 스트림 키를 확인해 주세요.'))
++
++        while grace_seconds > 0 and not cancel.is_set() and not (stop_event is not None and stop_event.is_set()):
++            next_index = len(parts) + 1
++            next_part = work / f"part_{next_index:03d}.ts"
++            report(tr('스트림 신호 끊김 · {seconds}초 동안 재연결을 대기합니다 (LTE 일시 끊김 보호)…',
++                      seconds=grace_seconds))
++            listen_kwargs = {"idle_timeout": grace_seconds}
++            if stop_event is not None:
++                listen_kwargs["stop_event"] = stop_event
++            if _listen_part(ffmpeg, info, next_part, cancel, report, **listen_kwargs):
++                parts.append(next_part)
++            else:
++                next_part.unlink(missing_ok=True)
++                break
++
++        if cancel.is_set():
++            raise InterruptedError(tr('작업을 취소했습니다.'))
++
++        final_path = work / "stream.ts"
++        if len(parts) == 1:
++            parts[0].rename(final_path)
++        else:
++            report(tr('재연결된 스트림 조각 {count}개를 하나로 합치고 있습니다…', count=len(parts)))
++            concat_file = work / "concat.txt"
++            concat_file.write_text(
++                "\n".join("file '" + part.name.replace("'", "'\\''") + "'" for part in parts) + "\n",
++                encoding="utf-8",
++            )
++            run_command(
++                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat",
++                 "-safe", "0", "-i", str(concat_file), "-c", "copy", str(final_path)],
++                cancel,
++                report,
++                cwd=work,
++            )
++            for part in parts:
++                part.unlink(missing_ok=True)
++            concat_file.unlink(missing_ok=True)
++
++        actual_duration = _media_duration(final_path)
++        if not math.isfinite(actual_duration) or actual_duration <= 0:
++            raise RuntimeError(tr('수신한 스트림 영상의 길이를 확인할 수 없습니다.'))
++        metadata = {
++            "title": f"OBS {protocol.upper()} Stream",
++            "uploader": "OBS",
++            "video_date": datetime.now().astimezone().strftime(tr('%Y-%m-%d %H시')),
++            "protocol": protocol,
++            "parts_count": len(parts),
++            "local_duration": actual_duration,
++            "is_live": True,
++        }
++        (work / "source.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
++        destination = directory / ("stream-" + uuid.uuid4().hex)
++        work.rename(destination)
++        saved_path = destination / final_path.name
++        report(tr('OBS 스트림 저장 완료 · {path}', path=saved_path))
++        return saved_path
++
++
++def _resolve_youtube_video_url(target: str, cancel: threading.Event, report) -> str | None:
++    try:
++        return youtube_url(target)
++    except ValueError:
++        pass
++    try:
++        output = run_command(
++            _command() + ["--skip-download", "--format", "bv*+ba/b", "--dump-single-json", "--", target],
++            cancel,
++            report,
++        )
++        data = json.loads(output)
++        video_id = data.get("id") if isinstance(data, dict) else None
++        if isinstance(video_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
++            return f"https://www.youtube.com/watch?v={video_id}"
++    except (ToolError, ValueError, RuntimeError):
++        return None
++    return None
++
++
++def _resolve_live_start_offset(first_snapshot: dict | None, final_snapshot: dict, *,
++                               from_start_click: bool = False) -> float:
++    """Compute the start offset inside final_snapshot when capturing from the [Start] button click."""
++    if not from_start_click or first_snapshot is None:
++        return 0.0
++    final_duration = float(final_snapshot.get("duration") or 0.0)
++    if final_duration <= 0:
++        return 0.0
++    first_duration = float(first_snapshot.get("duration") or 0.0)
++    first_win = first_snapshot.get("window") or {}
++    final_win = final_snapshot.get("window") or {}
++    first_utc = first_win.get("start_utc")
++    final_utc = final_win.get("start_utc")
++    if isinstance(first_utc, (int, float)) and isinstance(final_utc, (int, float)):
++        start_edge_utc = float(first_utc) + first_duration
++        raw_offset = start_edge_utc - float(final_utc)
++    else:
++        raw_offset = first_duration
++    if raw_offset <= 0:
++        return 0.0
++    if raw_offset >= final_duration:
++        return max(0.0, final_duration - min(final_duration, 10.0))
++    return round(raw_offset, 3)
++
++
++def _wait_poll(cancel: threading.Event, stop_event: threading.Event | None, seconds: float) -> bool:
++    """Sleep up to seconds; raise on cancel and return True immediately if stop_event is set."""
++    if stop_event is None:
++        if cancel.wait(seconds):
++            raise InterruptedError(tr('작업을 취소했습니다.'))
++        return False
++    deadline = time.monotonic() + max(0.0, float(seconds))
++    while True:
++        if cancel.is_set():
++            raise InterruptedError(tr('작업을 취소했습니다.'))
++        if stop_event.is_set():
++            return True
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            return False
++        if cancel.wait(min(0.1, remaining)):
++            raise InterruptedError(tr('작업을 취소했습니다.'))
++
++
++def watch_youtube_stream(url: str, directory: Path, cancel: threading.Event, report, *,
++                         poll_seconds: float = 15.0, workers: int = 4,
++                         wait_for_end: bool = True, max_polls: int = 0,
++                         stop_event: threading.Event | None = None,
++                         from_start_click: bool = False) -> dict:
++    """Monitor a YouTube live or channel URL and download the session automatically."""
++    target = youtube_stream_target(url)
++    if type(workers) is not int or not 1 <= workers <= 16:
++        raise ValueError(tr('동시 다운로드 수는 1–16개로 지정해 주세요.'))
++    if not isinstance(poll_seconds, (int, float)) or not math.isfinite(poll_seconds) or not 1 <= poll_seconds <= 300:
++        raise ValueError(tr('감지 주기는 1–300초 사이로 지정해 주세요.'))
++
++    first_snapshot = None
++    last_snapshot = None
++    polls = 0
++
++    def _download_from_snapshot(snapshot: dict, *, stopped: bool = False) -> dict:
++        snap_duration = float(snapshot.get("duration") or 0.0)
++        start_sec = _resolve_live_start_offset(
++            first_snapshot, snapshot, from_start_click=from_start_click
++        )
++        path = download_section(
++            snapshot["url"], start_sec, snap_duration, directory, cancel, report,
++            snapshot=snapshot, workers=workers,
++        )
++        result = {"path": path, "metadata": snapshot, "start": start_sec, "end": snap_duration}
++        if stopped:
++            result["stopped"] = True
++        return result
++
++    while True:
++        if cancel.is_set():
++            raise InterruptedError(tr('작업을 취소했습니다.'))
++        stop_requested = stop_event is not None and stop_event.is_set()
++        polls += 1
++        if stop_requested:
++            report(tr('수신 정지 요청됨 · 현재 시점까지의 라이브 구간을 다운로드합니다…'))
++        else:
++            report(tr('YouTube 스트림 상태를 확인하고 있습니다…'))
++        video_url = _resolve_youtube_video_url(target, cancel, report)
++        if video_url is not None:
++            try:
++                metadata = inspect_source(video_url, cancel, report)
++            except (ToolError, ValueError, RuntimeError):
++                metadata = None
++            if metadata is not None:
++                duration = metadata.get("duration") or 0
++                if metadata.get("is_live"):
++                    if duration > 0:
++                        if first_snapshot is None:
++                            first_snapshot = metadata
++                        last_snapshot = metadata
++                        if stop_requested or (stop_event is not None and stop_event.is_set()):
++                            return _download_from_snapshot(metadata, stopped=True)
++                        if not wait_for_end:
++                            return _download_from_snapshot(metadata, stopped=False)
++                        if from_start_click:
++                            start_pos = _resolve_live_start_offset(
++                                first_snapshot, metadata, from_start_click=True
++                            )
++                            report(tr('라이브 녹화 추적 중: {title} · 구간 {start:.1f}초 ~ {seconds:.1f}초 · [수신 정지] 또는 방송 종료 시 클립을 생성합니다.',
++                                      title=metadata.get("title", "YouTube"), start=start_pos, seconds=duration))
++                        else:
++                            report(tr('라이브 감지됨: {title} · 현재 {seconds:.1f}초 · 송출 종료 시 자동 다운로드합니다.',
++                                      title=metadata.get("title", "YouTube"), seconds=duration))
++                elif duration > 0:
++                    return _download_from_snapshot(metadata, stopped=stop_requested)
++                elif last_snapshot is not None:
++                    return _download_from_snapshot(last_snapshot, stopped=stop_requested)
++            elif last_snapshot is not None:
++                return _download_from_snapshot(last_snapshot, stopped=stop_requested)
++        elif last_snapshot is not None:
++            return _download_from_snapshot(last_snapshot, stopped=stop_requested)
++
++        if stop_requested or (stop_event is not None and stop_event.is_set()):
++            if last_snapshot is not None:
++                return _download_from_snapshot(last_snapshot, stopped=True)
++            raise RuntimeError(tr('수신된 YouTube 라이브 구간이 없어 작업을 종료했습니다.'))
++
++        if max_polls > 0 and polls >= max_polls:
++            raise RuntimeError(tr('진행 중인 YouTube 라이브 방송을 찾지 못했습니다.'))
++        report(tr('방송 시작 대기 중 · {seconds:g}초 후 다시 확인합니다…', seconds=poll_seconds))
++        if _wait_poll(cancel, stop_event, poll_seconds):
++            continue
++
++
++def auto_clip_session(video_path: Path, profile: dict | None, directory: Path,
++                      output_directory: Path | None, cancel: threading.Event, report, *,
++                      start_offset: float = -10.0, end_offset: float = 10.0,
++                      export_settings: dict | None = None, analysis_options: dict | None = None,
++                      auto_export: bool = True) -> dict:
++    """Analyze a recorded stream session and automatically export detected song clips."""
++    video_path = Path(video_path).resolve()
++    duration = _media_duration(video_path)
++    outcome = {
++        "path": video_path,
++        "duration": duration,
++        "analysis": None,
++        "originals": [],
++        "clips": [],
++        "exported": {"saved": [], "failed": [], "cancelled": False},
++    }
++    if not auto_export or profile is None:
++        return outcome
++
++    options = dict(analysis_options or {})
++    analysis = analyze(video_path, 0, duration, profile, directory, cancel, report, **options)
++    outcome["analysis"] = analysis
++    if analysis.get("cancelled"):
++        outcome["exported"]["cancelled"] = True
++        return outcome
++
++    from clips import offset_bounds, validate_clip
++    originals = []
++    clips = []
++    for raw in analysis.get("clips", []):
++        row = dict(raw)
++        row["clip_id"] = uuid.uuid4().hex
++        originals.append(validate_clip(row))
++        edited = dict(row)
++        try:
++            edited["start"], edited["end"] = offset_bounds(
++                edited["start"], edited["end"], start_offset, end_offset, duration
++            )
++        except ValueError:
++            pass
++        has_song = bool(edited.get("song_id") or edited.get("image_url"))
++        edited["selected"] = has_song
++        clips.append(validate_clip(edited))
++
++    if clips and not any(row.get("selected") for row in clips):
++        for row in clips:
++            row["selected"] = True
++
++    outcome["originals"] = originals
++    outcome["clips"] = clips
++
++    selected = [row for row in clips if row.get("selected")]
++    if selected and output_directory is not None:
++        settings = {"mode": "fast"}
++        if export_settings:
++            settings.update(export_settings)
++        outcome["exported"] = export_clips(selected, Path(output_directory), cancel, report, **settings)
++    return outcome
+diff --git "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\workspace_ui.py" "b/src\\workspace_ui.py"
+index a35534f..a582b93 100644
+--- "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\workspace_ui.py"
++++ "b/src\\workspace_ui.py"
+@@ -226,6 +226,122 @@ def build_window(w):
+     w.url.textChanged.connect(w.url_error.hide)
+     w.button(tr('영상 정보 확인 →'), w.inspect_link, body).setProperty("primary", True)
+ 
++    from stream_ingest import generate_stream_key
++    stream_settings = QSettings('ArcadeClip', 'ArcadeClip')
++    w.stream_group = QGroupBox(tr('OBS 스트림 자동 클립'))
++    stream_layout = QVBoxLayout(w.stream_group)
++    w.stream_mode = QComboBox()
++    w.stream_mode.addItem(tr('선택지 A · 직접 수신 (RTMP/SRT)'), 'direct')
++    w.stream_mode.addItem(tr('선택지 B · YouTube 라이브 자동 감지'), 'youtube')
++    saved_mode = stream_settings.value('stream/mode', 'direct')
++    w.stream_mode.setCurrentIndex(max(0, w.stream_mode.findData(saved_mode)))
++    stream_layout.addWidget(w.stream_mode)
++
++    w.stream_direct_panel = QWidget()
++    direct_form = QFormLayout(w.stream_direct_panel)
++    direct_form.setContentsMargins(0, 0, 0, 0)
++    w.stream_protocol = QComboBox()
++    w.stream_protocol.addItem(tr('RTMP (1935 · 기본)'), 'rtmp')
++    w.stream_protocol.addItem(tr('SRT (9000 · LTE 끊김 방어)'), 'srt')
++    saved_proto = stream_settings.value('stream/protocol', 'rtmp')
++    w.stream_protocol.setCurrentIndex(max(0, w.stream_protocol.findData(saved_proto)))
++    w.stream_port = QSpinBox()
++    w.stream_port.setRange(1, 65535)
++    try:
++        saved_port = int(stream_settings.value('stream/port', 9000 if saved_proto == 'srt' else 1935))
++    except (TypeError, ValueError):
++        saved_port = 1935
++    w.stream_port.setValue(max(1, min(65535, saved_port)))
++    w.stream_host = QLineEdit(str(stream_settings.value('stream/host', '') or ''))
++    w.stream_host.setPlaceholderText("myarcade.iptime.org")
++    w.stream_grace = QSpinBox()
++    w.stream_grace.setRange(0, 600)
++    w.stream_grace.setSuffix(tr(' 초'))
++    try:
++        saved_grace = int(stream_settings.value('stream/grace_seconds', 60))
++    except (TypeError, ValueError):
++        saved_grace = 60
++    w.stream_grace.setValue(max(0, min(600, saved_grace)))
++    saved_key = str(stream_settings.value('stream/key', '') or '').strip()
++    if not saved_key:
++        saved_key = generate_stream_key()
++        stream_settings.setValue('stream/key', saved_key)
++    w.stream_key = QLineEdit(saved_key)
++    key_row = QHBoxLayout()
++    key_row.addWidget(w.stream_key, 1)
++    w.copy_stream_key = w.button(tr('키 복사'), w.copy_obs_stream_key, key_row, busy=False)
++    w.regenerate_stream_key = w.button(tr('재발급'), w.new_obs_stream_key, key_row)
++    w.stream_server_url = QLineEdit()
++    w.stream_server_url.setReadOnly(True)
++    server_row = QHBoxLayout()
++    server_row.addWidget(w.stream_server_url, 1)
++    w.copy_stream_server = w.button(tr('서버 복사'), w.copy_obs_server_url, server_row, busy=False)
++    direct_form.addRow(tr('프로토콜'), w.stream_protocol)
++    direct_form.addRow(tr('수신 포트'), w.stream_port)
++    direct_form.addRow(tr('고정 주소 (DDNS/IP)'), w.stream_host)
++    direct_form.addRow(tr('LTE 재연결 대기'), w.stream_grace)
++    direct_form.addRow(tr('스트림 키'), key_row)
++    direct_form.addRow(tr('OBS 서버 주소'), server_row)
++    w.stream_guide_button = QPushButton(tr('포트포워딩 · 고정 DDNS 가이드'))
++    w.stream_guide_button.clicked.connect(w.show_stream_network_guide)
++    direct_form.addRow(w.stream_guide_button)
++    stream_layout.addWidget(w.stream_direct_panel)
++
++    w.stream_youtube_panel = QWidget()
++    yt_form = QFormLayout(w.stream_youtube_panel)
++    yt_form.setContentsMargins(0, 0, 0, 0)
++    w.stream_youtube_url = QLineEdit(str(stream_settings.value('stream/youtube_url', '') or ''))
++    w.stream_youtube_url.setPlaceholderText("https://www.youtube.com/watch?v=… / @channel/live")
++    yt_url_row = QHBoxLayout()
++    yt_url_row.addWidget(w.stream_youtube_url, 1)
++    w.paste_stream_youtube_url = w.button(tr('링크 붙여넣기'), w.paste_obs_youtube_url, yt_url_row)
++    w.stream_poll_seconds = QSpinBox()
++    w.stream_poll_seconds.setRange(1, 300)
++    w.stream_poll_seconds.setSuffix(tr(' 초'))
++    try:
++        saved_poll = int(stream_settings.value('stream/poll_seconds', 15))
++    except (TypeError, ValueError):
++        saved_poll = 15
++    w.stream_poll_seconds.setValue(max(1, min(300, saved_poll)))
++    w.stream_wait_end = QCheckBox(tr('송출 종료 시 전체 구간 다운로드'))
++    w.stream_wait_end.setChecked(stream_settings.value('stream/wait_end', True, type=bool))
++    w.stream_from_start_click = QCheckBox(tr('시작~정지 누른 구간만 부분 녹화 (개별 라이브용)'))
++    w.stream_from_start_click.setChecked(stream_settings.value('stream/from_start_click', True, type=bool))
++    yt_form.addRow(tr('감시 주소'), yt_url_row)
++    yt_form.addRow(tr('감지 주기'), w.stream_poll_seconds)
++    yt_form.addRow(w.stream_wait_end)
++    yt_form.addRow(w.stream_from_start_click)
++    stream_layout.addWidget(w.stream_youtube_panel)
++
++    w.stream_auto_clip = QCheckBox(tr('수신 후 자동으로 곡 분석 및 클립 저장'))
++    w.stream_auto_clip.setChecked(stream_settings.value('stream/auto_clip', True, type=bool))
++    stream_layout.addWidget(w.stream_auto_clip)
++    stream_action_row = QHBoxLayout()
++    w.stream_start_button = w.button(tr('스트림 자동 수신 시작'), w.start_stream_ingest, stream_action_row)
++    w.stream_start_button.setProperty("primary", True)
++    w.stream_stop_button = w.button(tr('수신 정지 · 클립 생성'), w.stop_stream_ingest, stream_action_row, busy=False)
++    w.stream_stop_button.setEnabled(False)
++    stream_layout.addLayout(stream_action_row)
++    body.addWidget(w.stream_group)
++    w.stream_mode.currentIndexChanged.connect(w.update_stream_ui)
++    w.stream_protocol.currentIndexChanged.connect(w.stream_protocol_changed)
++    w.stream_port.valueChanged.connect(w.update_stream_ui)
++    w.stream_host.textChanged.connect(w.update_stream_ui)
++    w.stream_key.textChanged.connect(w.update_stream_ui)
++    w.stream_grace.valueChanged.connect(w.update_stream_ui)
++    w.stream_youtube_url.textChanged.connect(w.update_stream_ui)
++    w.stream_poll_seconds.valueChanged.connect(w.update_stream_ui)
++    w.stream_wait_end.toggled.connect(w.update_stream_ui)
++    w.stream_from_start_click.toggled.connect(w.update_stream_ui)
++    w.stream_auto_clip.toggled.connect(w.update_stream_ui)
++    w.busy_controls.extend((
++        w.stream_mode, w.stream_protocol, w.stream_port, w.stream_host,
++        w.stream_grace, w.stream_key, w.stream_youtube_url,
++        w.stream_poll_seconds, w.stream_wait_end, w.stream_from_start_click,
++        w.stream_auto_clip,
++    ))
++    w.update_stream_ui()
++
+     body.addStretch()
+     w.source_next = w.button(tr('시간 선택으로 →'), lambda: w.set_stage(1), body)
+     w.source_next.setProperty("primary", True)
+diff --git "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\app.py" "b/src\\app.py"
+index 1e34a25..29b6fd5 100644
+--- "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\app.py"
++++ "b/src\\app.py"
+@@ -1140,6 +1140,294 @@ class MainWindow(QMainWindow):
+         self.set_stage(0)
+         self.save_recovery()
+ 
++    def stream_protocol_changed(self):
++        protocol = self.stream_protocol.currentData()
++        if protocol == "srt" and self.stream_port.value() == 1935:
++            self.stream_port.setValue(9000)
++        elif protocol == "rtmp" and self.stream_port.value() == 9000:
++            self.stream_port.setValue(1935)
++        self.update_stream_ui()
++
++    def update_stream_ui(self, *_):
++        from stream_ingest import is_individual_youtube_live_url, obs_connection_info
++        mode = self.stream_mode.currentData()
++        self.stream_direct_panel.setVisible(mode == "direct")
++        self.stream_youtube_panel.setVisible(mode == "youtube")
++        protocol = self.stream_protocol.currentData()
++        port = self.stream_port.value()
++        host = self.stream_host.text().strip()
++        key = self.stream_key.text().strip()
++        try:
++            info = obs_connection_info(protocol, host or "127.0.0.1", port, key or "ac-0000")
++            self.stream_server_url.setText(info["server_url"])
++        except ValueError:
++            self.stream_server_url.setText("")
++        yt_url = self.stream_youtube_url.text().strip()
++        if hasattr(self, "stream_start_button"):
++            if mode == "youtube" and is_individual_youtube_live_url(yt_url):
++                self.stream_start_button.setText(tr('개별 라이브 녹화 시작'))
++            else:
++                self.stream_start_button.setText(tr('스트림 자동 수신 시작'))
++        settings = QSettings("ArcadeClip", "ArcadeClip")
++        settings.setValue("stream/mode", mode)
++        settings.setValue("stream/protocol", protocol)
++        settings.setValue("stream/port", port)
++        settings.setValue("stream/host", host)
++        settings.setValue("stream/grace_seconds", self.stream_grace.value())
++        if key:
++            settings.setValue("stream/key", key)
++        settings.setValue("stream/youtube_url", yt_url)
++        settings.setValue("stream/poll_seconds", self.stream_poll_seconds.value())
++        settings.setValue("stream/wait_end", self.stream_wait_end.isChecked())
++        if hasattr(self, "stream_from_start_click"):
++            settings.setValue("stream/from_start_click", self.stream_from_start_click.isChecked())
++        settings.setValue("stream/auto_clip", self.stream_auto_clip.isChecked())
++
++    def paste_obs_youtube_url(self):
++        from stream_ingest import is_individual_youtube_live_url, youtube_stream_target
++        clipboard_text = QApplication.clipboard().text().strip()
++        fallback_text = self.url.text().strip() if hasattr(self, "url") else ""
++        target = None
++        for candidate in (clipboard_text, fallback_text):
++            if not candidate:
++                continue
++            try:
++                target = youtube_stream_target(candidate)
++                break
++            except ValueError:
++                continue
++        if target is None:
++            self.status.setText(tr('클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다.'))
++            return
++        self.stream_youtube_url.setText(target)
++        yt_idx = self.stream_mode.findData("youtube")
++        if yt_idx >= 0:
++            self.stream_mode.setCurrentIndex(yt_idx)
++        if is_individual_youtube_live_url(target):
++            self.status.setText(tr('개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작]과 [수신 정지 · 클립 생성]으로 원하는 구간을 녹화할 수 있습니다.'))
++        else:
++            self.status.setText(tr('YouTube 채널 라이브 주소를 붙여넣었습니다.'))
++
++    def stop_stream_ingest(self):
++        stop_event = getattr(self, "stream_stop_event", None)
++        if stop_event is not None and self.task:
++            stop_event.set()
++            if hasattr(self, "stream_stop_button"):
++                self.stream_stop_button.setEnabled(False)
++            self.status.setText(tr('수신을 정지하고 현재까지 녹화된 구간으로 클립 생성을 시작합니다…'))
++
++    def copy_obs_stream_key(self):
++        from stream_ingest import validate_stream_key
++        try:
++            key = validate_stream_key(self.stream_key.text())
++        except ValueError as error:
++            self.fail(error)
++            return
++        QApplication.clipboard().setText(key)
++        self.status.setText(tr('스트림 키를 복사했습니다.'))
++
++    def copy_obs_server_url(self):
++        text = self.stream_server_url.text().strip()
++        if not text:
++            self.status.setText(tr('고정 주소(DDNS 또는 IP)와 스트림 키 형식을 확인해 주세요.'))
++            return
++        QApplication.clipboard().setText(text)
++        self.status.setText(tr('OBS 서버 주소를 복사했습니다.'))
++
++    def new_obs_stream_key(self):
++        from stream_ingest import generate_stream_key
++        key = generate_stream_key()
++        self.stream_key.setText(key)
++        self.status.setText(tr('새 스트림 키를 발급했습니다.'))
++
++    def show_stream_network_guide(self):
++        from PySide6.QtWidgets import QDialog, QHBoxLayout, QPlainTextEdit, QVBoxLayout
++        from stream_ingest import port_forwarding_guide
++        guide_text = port_forwarding_guide(
++            self.stream_protocol.currentData(),
++            self.stream_port.value(),
++            self.stream_host.text(),
++            self.stream_key.text(),
++        )
++        dialog = QDialog(self)
++        dialog.setWindowTitle(tr('포트포워딩 · 고정 DDNS 가이드'))
++        dialog.resize(620, 520)
++        layout = QVBoxLayout(dialog)
++        viewer = QPlainTextEdit()
++        viewer.setReadOnly(True)
++        viewer.setPlainText(guide_text)
++        layout.addWidget(viewer, 1)
++        buttons = QHBoxLayout()
++        copy_btn = QPushButton(tr('안내문 복사'))
++        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(guide_text))
++        close_btn = QPushButton(tr('닫기'))
++        close_btn.setDefault(True)
++        close_btn.clicked.connect(dialog.accept)
++        buttons.addStretch()
++        buttons.addWidget(copy_btn)
++        buttons.addWidget(close_btn)
++        layout.addLayout(buttons)
++        dialog.exec()
++
++    def _resolve_stream_profile(self):
++        if self.preview.regions:
++            require_regions(self.preview.regions)
++            return self.profile.current_profile(require_complete=True)
++        if self.profile.saved_profile:
++            return validate_profile(deepcopy(self.profile.saved_profile))
++        profiles_dir = self.directory / "profiles"
++        if profiles_dir.is_dir():
++            for candidate in sorted(profiles_dir.glob("*.json")):
++                if candidate.name.startswith("offset-"):
++                    continue
++                try:
++                    return load_profile(candidate)
++                except (ValueError, OSError):
++                    continue
++        require_regions(self.preview.regions)
++        return None
++
++    def start_stream_ingest(self):
++        if self.task:
++            return
++        import threading
++        from stream_ingest import (
++            auto_clip_session,
++            obs_connection_info,
++            receive_direct_stream,
++            watch_youtube_stream,
++            youtube_stream_target,
++        )
++        try:
++            auto_clip = self.stream_auto_clip.isChecked()
++            profile = self._resolve_stream_profile() if auto_clip else None
++            mode = self.stream_mode.currentData()
++            streams_dir = self.directory / "streams"
++            output_dir = Path(self.output_directory.text().strip() or str(self.directory / "clips")).expanduser()
++            if self.export_date_folder.isChecked():
++                output_dir /= datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
++            start_offset = self.clip_start_offset.value()
++            end_offset = self.clip_end_offset.value()
++            export_settings = {
++                "mode": self.export_mode.currentData(),
++                "crf": self.encoder_crf.value(),
++                "preset": self.encoder_preset.currentText(),
++                "audio": self.export_audio,
++            }
++            if export_settings["mode"] == "accurate":
++                export_settings.update(self.export_options)
++            analysis_options = {
++                "workers": self.analysis_workers.value(),
++                "decoder_threads": self.decoder_threads.value(),
++                "ocr_workers": self.ocr_workers.value(),
++                "gpu": self.gpu_decode.isChecked(),
++                "gpu_convert": self.gpu_convert.isChecked(),
++                "pipelined": self.analysis_pipeline.isChecked(),
++            }
++            stop_event = threading.Event()
++            if mode == "direct":
++                protocol = self.stream_protocol.currentData()
++                port = self.stream_port.value()
++                host = self.stream_host.text().strip() or "127.0.0.1"
++                key = self.stream_key.text().strip()
++                grace = self.stream_grace.value()
++                obs_connection_info(protocol, host, port, key)
++
++                def operation(cancel, report):
++                    video_path = receive_direct_stream(
++                        protocol, port, key, streams_dir, cancel, report,
++                        host=host, grace_seconds=grace, stop_event=stop_event,
++                    )
++                    source_meta = {}
++                    meta_file = video_path.parent / "source.json"
++                    if meta_file.is_file():
++                        try:
++                            source_meta = json.loads(meta_file.read_text(encoding="utf-8"))
++                        except (OSError, ValueError):
++                            source_meta = {}
++                    outcome = auto_clip_session(
++                        video_path, profile, self.directory, output_dir, cancel, report,
++                        start_offset=start_offset, end_offset=end_offset,
++                        export_settings=export_settings, analysis_options=analysis_options,
++                        auto_export=auto_clip,
++                    )
++                    outcome["metadata"] = source_meta
++                    return outcome
++            else:
++                raw_yt = self.stream_youtube_url.text().strip()
++                if not raw_yt and hasattr(self, "url") and self.url.text().strip():
++                    raw_yt = self.url.text().strip()
++                    self.stream_youtube_url.setText(raw_yt)
++                target_url = youtube_stream_target(raw_yt)
++                poll_seconds = self.stream_poll_seconds.value()
++                wait_end = self.stream_wait_end.isChecked()
++                from_start_click = (
++                    self.stream_from_start_click.isChecked()
++                    if hasattr(self, "stream_from_start_click")
++                    else False
++                )
++                workers = self.download_workers.value()
++
++                def operation(cancel, report):
++                    watched = watch_youtube_stream(
++                        target_url, self.directory / "downloads", cancel, report,
++                        poll_seconds=poll_seconds, workers=workers, wait_for_end=wait_end,
++                        stop_event=stop_event, from_start_click=from_start_click,
++                    )
++                    outcome = auto_clip_session(
++                        watched["path"], profile, self.directory, output_dir, cancel, report,
++                        start_offset=start_offset, end_offset=end_offset,
++                        export_settings=export_settings, analysis_options=analysis_options,
++                        auto_export=auto_clip,
++                    )
++                    outcome["metadata"] = watched.get("metadata") or {}
++                    return outcome
++
++            self.stream_stop_event = stop_event
++            self.preview.player.pause()
++            self.run_task(operation, self.stream_ingest_finished)
++            if hasattr(self, "stream_stop_button"):
++                self.stream_stop_button.setEnabled(True)
++        except (ValueError, OSError) as error:
++            self.fail(error)
++
++    def stream_ingest_finished(self, result):
++        path = Path(result["path"])
++        metadata = result.get("metadata") or {}
++        duration = result.get("duration") or metadata.get("local_duration") or 0
++        self.source_info[source_key(path)] = {
++            "title": metadata.get("title", "OBS Stream"),
++            "channel": metadata.get("uploader") or metadata.get("channel") or "OBS",
++            "date": metadata.get("video_date", tr('날짜 미제공')),
++            "kind": "LIVE",
++            "range": f"{format_time(0)} – {format_time(duration)}",
++        }
++        self.add_paths([path])
++        analysis = result.get("analysis") or {}
++        if analysis.get("profile"):
++            self.profile.accept_calibration(analysis["profile"])
++        key = source_key(path)
++        if result.get("originals"):
++            self.detected_ranges[key] = deepcopy(result["originals"])
++        if result.get("clips"):
++            self.ranges = deepcopy(result["clips"])
++            self.source_ranges[key] = self.ranges
++            self.refresh_ranges()
++        exported = result.get("exported") or {}
++        saved = exported.get("saved") or []
++        if saved:
++            self.last_exports = exported
++            for saved_path in saved:
++                self.log.appendPlainText(tr('저장 완료: {path}', path=saved_path))
++            self.status.setText(tr('스트림 자동 저장 및 클립 {count:,}개 추출 완료', count=len(saved)))
++            self.set_stage(3)
++        elif result.get("clips"):
++            self.status.setText(tr('구간 후보 {value1:,}개를 추가했습니다. 미리보기에서 확인해 주세요.', value1=len(result['clips'])))
++            self.set_stage(3)
++        else:
++            self.status.setText(tr('스트림 자동 저장 완료: {name}', name=path.name))
++        self.save_recovery()
++
+     def run_task(self, operation, success, log=None):
+         if self.task:
+             return
+@@ -1161,6 +1449,9 @@ class MainWindow(QMainWindow):
+     def task_finished(self, success):
+         self.task.wait()
+         task, self.task = self.task, None
++        self.stream_stop_event = None
++        if hasattr(self, "stream_stop_button"):
++            self.stream_stop_button.setEnabled(False)
+         for control in self.busy_controls:
+             control.setEnabled(True)
+         self.progress.hide()
+diff --git "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\arcadeclip.pot" "b/src\\locales\\arcadeclip.pot"
+index 71d9b2a..b2fe415 100644
+--- "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\arcadeclip.pot"
++++ "b/src\\locales\\arcadeclip.pot"
+@@ -1468,3 +1468,1480 @@ msgstr ""
+ msgid "스트림 키는 영문·숫자·하이픈(-)으로 4–64자를 입력해 주세요."
+ msgstr ""
+ 
++#: src/app.py:1227
++msgid "스트림 키를 복사했습니다."
++msgstr ""
++
++#: src/timeline.py:35
++msgid "시간 범위: 양 끝 핸들을 드래그해 조절"
++msgstr ""
++
++#: src/app.py:142 src/workspace_ui.py:348 src/workspace_ui.py:59
++msgid "시간 선택"
++msgstr ""
++
++#: src/app.py:141 src/workspace_ui.py:346
++msgid "시간 선택으로 →"
++msgstr ""
++
++#: src/export_settings.py:32
++msgid "시간과 압축률 균형"
++msgstr ""
++
++#: src/media.py:16
++msgid "시간을 HH:MM:SS 형식으로 입력해 주세요."
++msgstr ""
++
++#: src/media.py:20
++msgid "시간을 확인해 주세요."
++msgstr ""
++
++#: src/chapters.py:23 src/workspace_ui.py:353 src/workspace_ui.py:429 src/youtube_preview.py:146
++msgid "시작"
++msgstr ""
++
++#: src/workspace_ui.py:442
++msgid "시작 부분 재생"
++msgstr ""
++
++#: src/workspace_ui.py:401
++msgid "시작 오프셋"
++msgstr ""
++
++#: src/workspace_ui.py:308
++msgid "시작~정지 누른 구간만 부분 녹화 (개별 라이브용)"
++msgstr ""
++
++#: src/sources.py:296
++msgid "시작과 끝 시각을 확인해 주세요."
++msgstr ""
++
++#: src/setup_dialog.py:38
++msgid "시작하기 →"
++msgstr ""
++
++#: src/workspace_ui.py:383
++msgid "실험용 D3D11VA 디코딩. 지원하지 않으면 CPU로 복귀합니다."
++msgstr ""
++
++#: src/workspace_ui.py:547
++msgid "쓸 수 있는 항목: "
++msgstr ""
++
++#: src/profile_panel.py:249
++msgid "아래"
++msgstr ""
++
++#: src/app.py:835
++msgid "아래 클립과 합치기"
++msgstr ""
++
++#: src/advanced_settings.py:148
++#, python-brace-format
++msgid "아직 공개된 버전이 없습니다. 현재 버전 {name}"
++msgstr ""
++
++#: src/youtube_preview.py:51
++msgid "아직 처리 중인 방송입니다. 처리가 끝난 뒤 정보를 다시 확인해 주세요."
++msgstr ""
++
++#: src/app.py:1261
++msgid "안내문 복사"
++msgstr ""
++
++#: src/profiles.py:115
++msgid "안전하지 않은 경로 또는 암호화된 파일이 있습니다."
++msgstr ""
++
++#: src/preview.py:432
++msgid "알 수 없는 인식 영역입니다."
++msgstr ""
++
++#: src/live.py:32
++msgid "암호화된 라이브 조각은 지원하지 않습니다."
++msgstr ""
++
++#: src/profiles.py:119
++msgid "압축 안의 프로필 파일이 너무 큽니다."
++msgstr ""
++
++#: src/profiles.py:122
++msgid "압축 파일에 유효한 프로필 JSON이 없습니다."
++msgstr ""
++
++#: src/profiles.py:109
++msgid "압축 파일의 크기 또는 파일 수가 너무 큽니다."
++msgstr ""
++
++#: src/advanced_settings.py:127 src/advanced_settings.py:151
++msgid "앱 버전"
++msgstr ""
++
++#: src/youtube_preview.py:140
++msgid "양끝 핸들: 시작·끝 조절 | 클릭: 미리보기 위치 | Ctrl+휠: 확대"
++msgstr ""
++
++#: src/advanced_settings.py:47 src/advanced_settings.py:42
++msgid "언어 변경은 앱을 다시 실행하면 적용됩니다."
++msgstr ""
++
++#: src/app.py:31
++msgid "영상 (*.mp4 *.mkv *.mov *.webm *.avi *.m4v *.ts);;모든 파일 (*)"
++msgstr ""
++
++#: src/app.py:502
++#, python-brace-format
++msgid "영상 (*{suffix})"
++msgstr ""
++
++#: src/export_settings.py:19
++msgid "영상 · 파일 형식과 용량"
++msgstr ""
++
++#: src/app.py:640 src/app.py:644 src/video_sampling.py:24 src/youtube_preview.py:32
++msgid "영상 길이 안에서 구간을 선택해 주세요."
++msgstr ""
++
++#: src/app.py:338
++msgid "영상 길이 안에서 구간을 지정해 주세요."
++msgstr ""
++
++#: src/app.py:498 src/chapters.py:116
++msgid "영상 길이를 확인하지 못해 챕터를 넣을 수 없습니다."
++msgstr ""
++
++#: src/app.py:775
++msgid "영상 길이를 확인한 후 적용해 주세요."
++msgstr ""
++
++#: src/export.py:26
++msgid "영상 길이를 확인할 수 없습니다."
++msgstr ""
++
++#: src/sources.py:309
++msgid "영상 길이를 확인할 수 없습니다. 영상 정보를 다시 확인해 주세요."
++msgstr ""
++
++#: src/advanced_settings.py:82
++msgid "영상 디코더 스레드"
++msgstr ""
++
++#: src/app.py:1654
++msgid "영상 메타데이터를 확인해 주세요."
++msgstr ""
++
++#: src/workspace_ui.py:86
++msgid "영상 목록"
++msgstr ""
++
++#: src/preview.py:63
++msgid "영상 미리보기 및 인식 영역"
++msgstr ""
++
++#: src/app.py:142 src/workspace_ui.py:59
++msgid "영상 선택"
++msgstr ""
++
++#: src/app.py:173
++msgid "영상 선택 → 구간 지정 → 곡 확인 → 파일 저장"
++msgstr ""
++
++#: src/export.py:20 src/media.py:103 src/video_sampling.py:13 src/video_sampling.py:56 src/youtube_preview.py:87
++msgid "영상 스트림을 찾을 수 없습니다."
++msgstr ""
++
++#: src/preview.py:382
++msgid "영상 재생 위치"
++msgstr ""
++
++#: src/workspace_ui.py:557
++msgid "영상 저장은 다시 인코딩하지 않고 챕터만 넣어 복사합니다."
++msgstr ""
++
++#: src/workspace_ui.py:227
++msgid "영상 정보 확인 →"
++msgstr ""
++
++#: src/live_dvr.py:41 src/youtube_preview.py:106
++msgid "영상 정보를 다시 확인해 주세요."
++msgstr ""
++
++#: src/sources.py:236
++msgid "영상 정보를 확인하고 있습니다."
++msgstr ""
++
++#: src/sources.py:221
++#, python-brace-format
++msgid "영상 처리 {percent}% · {elapsed:.1f} / {seconds:.1f}초"
++msgstr ""
++
++#: src/tool_errors.py:64
++msgid "영상 처리 도구가 작업을 완료하지 못했습니다. Settings → 진단의 오류 내용을 확인하세요. 계속 실패하면 최신 앱으로 다시 시도하세요."
++msgstr ""
++
++#: src/tool_errors.py:61
++msgid "영상 처리 도구를 실행하지 못했습니다. Windows 10·11 x64용 앱의 ZIP 전체를 새 폴더에 풀고 다시 실행하세요."
++msgstr ""
++
++#: src/tool_errors.py:59
++msgid "영상 처리 도구를 찾지 못했습니다. 최신 앱의 ZIP 전체를 새 폴더에 풀고 다시 실행하세요."
++msgstr ""
++
++#: src/app.py:529
++msgid "영상 추가"
++msgstr ""
++
++#: src/app.py:533
++msgid "영상 폴더"
++msgstr ""
++
++#: src/tool_errors.py:55
++msgid "영상 형식을 읽거나 변환하지 못했습니다. 원본이 정상 재생되는지 확인하고, 다시 내려받거나 다른 형식의 영상을 선택하세요."
++msgstr ""
++
++#: src/live.py:138
++msgid "영상 형식이 바뀐 구간입니다. 앞뒤로 나눠 선택해 주세요."
++msgstr ""
++
++#: src/recognition.py:70
++msgid "영상과 프로파일의 화면 비율이 다릅니다."
++msgstr ""
++
++#: src/media.py:57
++msgid "영상과 프로파일의 화면 비율이 다릅니다. 영역을 다시 지정해 주세요."
++msgstr ""
++
++#: src/profile_panel.py:96
++msgid "영상에서 드래그해 영역을 지정하세요."
++msgstr ""
++
++#: src/preview.py:259
++msgid "영상을 선택하세요"
++msgstr ""
++
++#: src/app.py:620
++msgid "영상을 열 수 없습니다. 파일을 다시 선택해 주세요."
++msgstr ""
++
++#: src/tool_errors.py:63
++msgid "영상을 읽거나 저장하지 못했습니다. 원본 파일·네트워크 연결과 저장 폴더 상태를 확인하세요. 자세한 내용은 Settings → 진단에서 확인하세요."
++msgstr ""
++
++#: src/workspace_ui.py:651
++msgid "영상을 추가해 주세요."
++msgstr ""
++
++#: src/tool_errors.py:53
++msgid "영상의 다운로드 형식을 처리하지 못했습니다. 정보를 새로고침하세요. 계속 실패하면 최신 앱을 받아 다시 시도하세요."
++msgstr ""
++
++#: src/profile_panel.py:56
++msgid "영역 선택"
++msgstr ""
++
++#: src/profile_panel.py:105
++msgid "영역 지우기"
++msgstr ""
++
++#: src/profile_panel.py:131
++msgid "영역 지정 예시"
++msgstr ""
++
++#: src/app.py:1118 src/app.py:245
++msgid "예상 남은 시간 계산 중…"
++msgstr ""
++
++#: src/profile_panel.py:86 src/profile_panel.py:127 src/profile_panel.py:150
++msgid "예시 일시정지"
++msgstr ""
++
++#: src/profile_panel.py:147
++msgid "예시 재생"
++msgstr ""
++
++#: src/export_settings.py:77
++msgid "오디오"
++msgstr ""
++
++#: src/export_settings.py:81
++msgid "오디오 품질"
++msgstr ""
++
++#: src/profile_panel.py:37
++msgid "오락실 프로필"
++msgstr ""
++
++#: src/profile_panel.py:40
++msgid "오락실 프로필 선택"
++msgstr ""
++
++#: src/app.py:1501
++#, python-brace-format
++msgid "오류 · {error}"
++msgstr ""
++
++#: src/profile_panel.py:249
++msgid "오른쪽"
++msgstr ""
++
++#: src/clips.py:94
++msgid "오프셋 적용 후 길이가 0 이하인 클립이 있습니다."
++msgstr ""
++
++#: src/license_dialog.py:19
++msgid "오픈소스 구성 요소 목록"
++msgstr ""
++
++#: src/advanced_settings.py:110 src/license_dialog.py:11
++msgid "오픈소스 라이선스"
++msgstr ""
++
++#: src/advanced_settings.py:113
++msgid "오픈소스 라이선스 보기"
++msgstr ""
++
++#: src/jackets.py:138
++msgid "올바른 자켓 PNG 파일이 아닙니다."
++msgstr ""
++
++#: src/setup_dialog.py:108
++msgid "옮기기"
++msgstr ""
++
++#: src/profile_panel.py:249
++msgid "왼쪽"
++msgstr ""
++
++#: src/live.py:116 src/live_dvr.py:59
++msgid "요청이 너무 많아 다운로드를 중지했습니다. 잠시 후 동시 다운로드 수를 줄여 다시 시도해 주세요."
++msgstr ""
++
++#: src/export.py:81
++msgid "용량 또는 오디오 설정을 확인해 주세요."
++msgstr ""
++
++#: src/export_settings.py:166 src/export_settings.py:29
++msgid "원본 빠른 복사"
++msgstr ""
++
++#: src/workspace_ui.py:473
++msgid "원본 빠른 복사 · 소리 포함"
++msgstr ""
++
++#: src/export.py:105
++msgid "원본 영상 파일을 찾을 수 없습니다."
++msgstr ""
++
++#: src/workspace_ui.py:137
++msgid "원본 영상은 유지됩니다. 현재 클립의 되돌리기로 복구할 수 있습니다."
++msgstr ""
++
++#: src/export_settings.py:64 src/export_settings.py:44 src/export_settings.py:50
++msgid "원본 유지"
++msgstr ""
++
++#: src/fragments.py:55
++#, python-brace-format
++msgid "원본 조각 다운로드 {done} / {total} · 동시 최대 {workers}개"
++msgstr ""
++
++#: src/fragments.py:35
++#, python-brace-format
++msgid "원본 조각 병렬 다운로드 · 동시 최대 {workers}개"
++msgstr ""
++
++#: src/chapters.py:133
++msgid "원본과 다른 파일 이름을 지정해 주세요."
++msgstr ""
++
++#: src/profile_panel.py:249
++msgid "위"
++msgstr ""
++
++#: src/profile_panel.py:74
++msgid "위 목록에서\n지정할 영역을 선택하세요."
++msgstr ""
++
++#: src/workspace_ui.py:191
++msgid "위: 자동 인식 클립    아래: 직접 추가한 클립"
++msgstr ""
++
++#: src/jacket_recognition.py:334
++#, python-brace-format
++msgid "위치 확정 · 거리 {distance} / 후보 차이 {margin} · 나머지 보정 생략"
++msgstr ""
++
++#: src/youtube_preview.py:134
++msgid "위치를 옮긴 뒤 1초 기다리면 미리보기를 가져옵니다."
++msgstr ""
++
++#: src/preview.py:404 src/preview.py:410
++msgid "음량"
++msgstr ""
++
++#: src/export_settings.py:176
++#, python-brace-format
++msgid "음량 {value1:+g} dB · {value2} · {value3}"
++msgstr ""
++
++#: src/export_settings.py:80
++msgid "음량 조절"
++msgstr ""
++
++#: src/workspace_ui.py:445
++msgid "이 구간 반복"
++msgstr ""
++
++#: src/workspace_ui.py:396
++msgid "이 구간에서 곡 찾기 →"
++msgstr ""
++
++#: src/live.py:34
++msgid "이 라이브 조각의 범위 형식은 지원하지 않습니다."
++msgstr ""
++
++#: src/live.py:80 src/live.py:88
++msgid "이 라이브에서 접근 가능한 과거 구간을 확인할 수 없습니다."
++msgstr ""
++
++#: src/app.py:877
++msgid "이 영상에 기존 클립이 있습니다. 자동 인식 결과를 어떻게 저장할까요?"
++msgstr ""
++
++#: src/media.py:51
++msgid "이 영상의 화면 변환을 처리할 수 없습니다. 회전과 반전을 영상에 적용한 파일을 사용해 주세요."
++msgstr ""
++
++#: src/media.py:54
++msgid "이 영상의 회전 각도를 처리할 수 없습니다."
++msgstr ""
++
++#: src/app.py:836
++msgid "이 클립을 목록에서 제거"
++msgstr ""
++
++#: src/license_dialog.py:43
++msgid "이 패키지에는 라이선스 원문이 포함되어 있지 않습니다. 프로젝트에서 제공하는 라이선스를 확인하세요."
++msgstr ""
++
++#: src/profile_panel.py:325 src/profile_panel.py:412
++msgid "이름"
++msgstr ""
++
++#: src/clips.py:100
++msgid "이름 미확인"
++msgstr ""
++
++#: src/workspace_ui.py:103
++msgid "이름 미확인도 표시"
++msgstr ""
++
++#: src/advanced_settings.py:77
++msgid "인식"
++msgstr ""
++
++#: src/recognition.py:54
++msgid "인식 결과의 구간 순서와 범위를 확인해 주세요."
++msgstr ""
++
++#: src/profiles.py:53
++msgid "인식 설정 범위를 확인해 주세요."
++msgstr ""
++
++#: src/profiles.py:47 src/profiles.py:49
++msgid "인식 설정 형식을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:142 src/workspace_ui.py:59
++msgid "인식 영역"
++msgstr ""
++
++#: src/profile_panel.py:55
++msgid "인식 영역 종류"
++msgstr ""
++
++#: src/profiles.py:37
++msgid "인식 영역 좌표를 확인해 주세요."
++msgstr ""
++
++#: src/profiles.py:34
++msgid "인식 영역 형식을 확인해 주세요."
++msgstr ""
++
++#: src/preview.py:240
++msgid "인식 영역 형식이 올바르지 않습니다."
++msgstr ""
++
++#: src/workspace_ui.py:366
++msgid "인식 영역으로 →"
++msgstr ""
++
++#: src/preview.py:244
++msgid "인식 영역은 영상 안의 사각형이어야 합니다."
++msgstr ""
++
++#: src/profiles.py:39
++msgid "인식 영역을 조금 더 크게 선택해 주세요."
++msgstr ""
++
++#: src/jacket_source_ui.py:33
++msgid "인증서 검사"
++msgstr ""
++
++#: src/sources.py:120
++msgid "인증서를 다시 확인하고 있습니다. 앱에 포함된 인증서로 한 번 더 연결합니다."
++msgstr ""
++
++#: src/advanced_settings.py:30
++msgid "일반"
++msgstr ""
++
++#: src/app.py:239 src/sources.py:317
++msgid "일반 다운로드 · 이 영상은 조각 병렬 다운로드를 지원하지 않습니다."
++msgstr ""
++
++#: src/app.py:1079 src/app.py:1133 src/app.py:548
++msgid "일반 동영상"
++msgstr ""
++
++#: src/setup_dialog.py:160
++msgid "일부 자켓 데이터를 다시 받아야 합니다. 시작하기를 눌러 주세요."
++msgstr ""
++
++#: src/jackets.py:400
++msgid "일부 자켓을 다시 받아 주세요."
++msgstr ""
++
++#: src/preview.py:533
++msgid "일시정지"
++msgstr ""
++
++#: src/workspace_ui.py:485
++msgid "자동 · CPU 수에 맞춤"
++msgstr ""
++
++#: src/workspace_ui.py:481
++msgid "자동 · CPU와 분석량에 맞춤"
++msgstr ""
++
++#: src/workspace_ui.py:477
++msgid "자동 · 최대 32스레드"
++msgstr ""
++
++#: src/app.py:809 src/workspace_ui.py:416
++msgid "자동 인식 결과로 복원"
++msgstr ""
++
++#: src/app.py:1644
++msgid "자동 인식 원본 식별자를 확인해 주세요."
++msgstr ""
++
++#: src/app.py:1641
++msgid "자동 인식 원본 형식을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:824
++msgid "자동 인식 원본으로 복원했습니다. 직접 추가한 클립은 유지됩니다."
++msgstr ""
++
++#: src/app.py:793
++#, python-brace-format
++msgid "자동 인식 원본을 기준으로 {count}개 클립에 오프셋을 적용했습니다."
++msgstr ""
++
++#: src/app.py:762
++msgid "자동 인식 원본을 기준으로 전역 오프셋을 적용합니다. 직접 추가한 클립은 유지됩니다."
++msgstr ""
++
++#: src/app.py:879
++msgid "자동 인식 클립 교체"
++msgstr ""
++
++#: src/export_settings.py:65
++msgid "자르는 방식"
++msgstr ""
++
++#: src/preview.py:13 src/profiles.py:10
++msgid "자켓"
++msgstr ""
++
++#: src/jackets.py:372
++#, python-brace-format
++msgid "자켓 다운로드 {index:,} / {value2:,}"
++msgstr ""
++
++#: src/jackets.py:366
++#, python-brace-format
++msgid "자켓 다운로드 {index:,} / {value2:,} · 재시도 필요 {value3:,}"
++msgstr ""
++
++#: src/advanced_settings.py:66 src/setup_dialog.py:103 src/workspace_ui.py:39
++msgid "자켓 데이터"
++msgstr ""
++
++#: src/jackets.py:273
++#, python-brace-format
++msgid "자켓 데이터 복사 중 {index:,} / {value2:,}"
++msgstr ""
++
++#: src/jacket_source_ui.py:118
++msgid "자켓 데이터 업데이트"
++msgstr ""
++
++#: src/app.py:1555
++msgid "자켓 데이터 업데이트 완료"
++msgstr ""
++
++#: src/jackets.py:271
++#, python-brace-format
++msgid "자켓 데이터 옮기는 중 {index:,} / {value2:,}"
++msgstr ""
++
++#: src/setup_dialog.py:131
++msgid "자켓 데이터를 확인하고 있습니다."
++msgstr ""
++
++#: src/jacket_recognition.py:356 src/jacket_recognition.py:46
++msgid "자켓 목록 준비"
++msgstr ""
++
++#: src/profiles.py:65
++msgid "자켓 보정 캐시 좌표·점수를 확인해 주세요."
++msgstr ""
++
++#: src/profiles.py:59
++msgid "자켓 보정 캐시 형식을 확인해 주세요."
++msgstr ""
++
++#: src/jackets.py:165 src/jackets.py:52
++msgid "자켓 서버 주소는 http:// 또는 https://로 시작해야 합니다."
++msgstr ""
++
++#: src/profile_panel.py:456
++msgid "자켓 영역 · 곡 판독"
++msgstr ""
++
++#: src/profiles.py:31
++msgid "자켓 영역을 선택해 주세요."
++msgstr ""
++
++#: src/jacket_recognition.py:343
++msgid "자켓 위치 보정"
++msgstr ""
++
++#: src/jacket_recognition.py:318
++#, python-brace-format
++msgid "자켓 위치 보정 · {value1:.1f}초 지점"
++msgstr ""
++
++#: src/profile_panel.py:462
++msgid "자켓 위치 보정 간격 (초)"
++msgstr ""
++
++#: src/jacket_recognition.py:385
++msgid "자켓 위치 보정에 실패했습니다. 영역과 테스트 인식을 확인해 주세요."
++msgstr ""
++
++#: src/jacket_source_ui.py:27 src/jacket_source_ui.py:31
++msgid "자켓 이미지 주소"
++msgstr ""
++
++#: src/jackets.py:141
++msgid "자켓 이미지가 손상되었습니다."
++msgstr ""
++
++#: src/jackets.py:400
++msgid "자켓 준비가 완료되었습니다."
++msgstr ""
++
++#: src/profile_panel.py:465
++msgid "자켓 차이 허용값"
++msgstr ""
++
++#: src/clips.py:69
++msgid "자켓 파일명을 확인해 주세요."
++msgstr ""
++
++#: src/jackets.py:127
++msgid "자켓 파일명이 올바르지 않습니다."
++msgstr ""
++
++#: src/advanced_settings.py:84
++msgid "자켓 판독 프로세스"
++msgstr ""
++
++#: src/jackets.py:364
++#, python-brace-format
++msgid "자켓 확인 {index:,} / {value2:,}"
++msgstr ""
++
++#: src/workspace_ui.py:368
++msgid "자켓과 글자 위치"
++msgstr ""
++
++#: src/export_settings.py:31
++msgid "작게 · 화질보다 용량 우선"
++msgstr ""
++
++#: src/app.py:1701
++#, python-brace-format
++msgid "작업 구간 {value1:,}개를 불러왔습니다."
++msgstr ""
++
++#: src/workspace_ui.py:34
++msgid "작업 열기"
++msgstr ""
++
++#: src/workspace_ui.py:35
++msgid "작업 저장"
++msgstr ""
++
++#: src/app.py:1634 src/app.py:1638
++msgid "작업 파일 형식을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:1660
++msgid "작업 파일의 선택된 영상을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:1656
++msgid "작업 파일의 영상 경로를 확인해 주세요."
++msgstr ""
++
++#: src/tool_errors.py:47
++msgid "작업에 필요한 메모리가 부족합니다. 다른 프로그램을 닫고 동시 작업 수나 영상 해상도를 낮춰 다시 시도하세요."
++msgstr ""
++
++#: src/app.py:1502
++msgid "작업을 완료하지 못했습니다. 고급에서 상세 내용을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:1492
++msgid "작업을 중지하고 있습니다."
++msgstr ""
++
++#: src/app.py:1467 src/sources.py:94 src/sources.py:136 src/sources.py:352 src/sources.py:158 src/sources.py:119 src/stream_ingest.py:192 src/stream_ingest.py:308 src/stream_ingest.py:400 src/stream_ingest.py:405 src/stream_ingest.py:412 src/stream_ingest.py:447 src/stream_ingest.py:278 src/stream_ingest.py:234
++msgid "작업을 취소했습니다."
++msgstr ""
++
++#: src/workspace_ui.py:273
++msgid "재발급"
++msgstr ""
++
++#: src/preview.py:378 src/preview.py:533
++msgid "재생"
++msgstr ""
++
++#: src/preview.py:394
++msgid "재생 배속"
++msgstr ""
++
++#: src/app.py:1535
++msgid "재시작 실패"
++msgstr ""
++
++#: src/stream_ingest.py:265
++msgid "재연결 대기 시간은 0–600초 사이로 지정해 주세요."
++msgstr ""
++
++#: src/stream_ingest.py:314
++#, python-brace-format
++msgid "재연결된 스트림 조각 {count}개를 하나로 합치고 있습니다…"
++msgstr ""
++
++#: src/tool_errors.py:45
++msgid "저장 공간이 부족합니다. 저장 폴더와 임시 폴더가 있는 드라이브의 공간을 확보한 뒤 다시 시도하세요."
++msgstr ""
++
++#: src/workspace_ui.py:464
++msgid "저장 대상 확인"
++msgstr ""
++
++#: src/export_settings.py:8 src/workspace_ui.py:520
++msgid "저장 설정"
++msgstr ""
++
++#: src/export.py:74
++msgid "저장 설정을 확인해 주세요."
++msgstr ""
++
++#: src/workspace_ui.py:508
++msgid "저장 시작 시 대상 폴더 아래에 YYYY-MM-DD_HH-MM-SS 형식의 폴더를 만듭니다."
++msgstr ""
++
++#: src/app.py:1010
++#, python-brace-format
++msgid "저장 실패: {source} · {error}"
++msgstr ""
++
++#: src/profile_panel.py:408
++msgid "저장 없이 곡 찾기"
++msgstr ""
++
++#: src/app.py:1017
++msgid "저장 완료"
++msgstr ""
++
++#: src/app.py:1008 src/app.py:1421
++#, python-brace-format
++msgid "저장 완료: {path}"
++msgstr ""
++
++#: src/app.py:1017
++msgid "저장 중지"
++msgstr ""
++
++#: src/workspace_ui.py:503
++msgid "저장 폴더"
++msgstr ""
++
++#: src/clips.py:57
++msgid "저장된 구간 형식을 확인해 주세요."
++msgstr ""
++
++#: src/export.py:166
++msgid "저장된 영상 길이가 선택 구간과 다릅니다."
++msgstr ""
++
++#: src/app.py:806
++msgid "저장된 자동 인식 원본이 없습니다."
++msgstr ""
++
++#: src/app.py:1000 src/export.py:76
++msgid "저장할 구간을 선택해 주세요."
++msgstr ""
++
++#: src/export.py:88
++msgid "저장할 구간의 시작과 끝 시각을 확인해 주세요."
++msgstr ""
++
++#: src/app.py:983
++msgid "저장할 영상을 먼저 열어 주세요."
++msgstr ""
++
++#: src/app.py:478 src/workspace_ui.py:500
++msgid "저장할 클립을 선택하세요."
++msgstr ""
++
++#: src/app.py:179
++msgid "저장할 파일 이름과 폴더, 설정을 확인하세요."
++msgstr ""
++
++#: src/workspace_ui.py:514
++msgid "저장할 파일명"
++msgstr ""
++
++#: src/setup_dialog.py:77
++msgid "저장할 폴더를 선택하세요."
++msgstr ""
++
++#: src/app.py:516
++msgid "저장할 폴더를 지정해 주세요."
++msgstr ""
++
++#: src/export_settings.py:149 src/profile_panel.py:257 src/setup_dialog.py:38
++msgid "적용"
++msgstr ""
++
++#: src/app.py:1523
++msgid "적용 후 재시작"
++msgstr ""
++
++#: src/export_settings.py:118
++#, python-brace-format
++msgid "적용할 설정: {preset}"
++msgstr ""
++
++#: src/export_settings.py:138
++msgid "적용할 설정: 사용자 지정"
++msgstr ""
++
++#: src/workspace_ui.py:363 src/youtube_preview.py:155
++msgid "전체 구간"
++msgstr ""
++
++#: src/workspace_ui.py:189 src/youtube_preview.py:156
++msgid "전체 시간 보기"
++msgstr ""
++
++#: src/app.py:152
++msgid "전체 시간축 · 분석 구간"
++msgstr ""
++
++#: src/app.py:152
++msgid "전체 시간축 · 점선 테두리: 확대해서 보는 범위"
++msgstr ""
++
++#: src/workspace_ui.py:176
++msgid "전체 시간축 가로 이동"
++msgstr ""
++
++#: src/workspace_ui.py:144
++msgid "전체 저장 (0)"
++msgstr ""
++
++#: src/sources.py:262
++msgid "접근 가능한 라이브 구간을 확인하고 있습니다."
++msgstr ""
++
++#: src/advanced_settings.py:108
++msgid "정보"
++msgstr ""
++
++#: src/workspace_ui.py:565
++msgid "정보 새로고침"
++msgstr ""
++
++#: src/export_settings.py:167
++msgid "정확한 구간"
++msgstr ""
++
++#: src/export_settings.py:28
++msgid "정확한 구간 자르기"
++msgstr ""
++
++#: src/workspace_ui.py:467
++msgid "정확한 저장"
++msgstr ""
++
++#: src/app.py:240
++msgid "조각 병렬 다운로드"
++msgstr ""
++
++#: src/app.py:1098
++msgid "조회 구간 첫 장면"
++msgstr ""
++
++#: src/live.py:125 src/live.py:136 src/live_dvr.py:149
++msgid "조회한 라이브 구간 안에서 시작과 끝을 선택해 주세요."
++msgstr ""
++
++#: src/live_dvr.py:31 src/sources.py:300
++msgid "조회한 영상과 다운로드 대상이 다릅니다."
++msgstr ""
++
++#: src/profile_panel.py:105
++msgid "좌표 입력"
++msgstr ""
++
++#: src/setup_dialog.py:166
++msgid "준비를 중지하고 있습니다."
++msgstr ""
++
++#: src/setup_dialog.py:147
++msgid "준비를 중지했습니다. 시작하기를 눌러 이어서 받을 수 있습니다."
++msgstr ""
++
++#: src/stream_ingest.py:80
++msgid "지원하지 않는 스트림 프로토콜입니다."
++msgstr ""
++
++#: src/jacket_source_ui.py:23
++msgid "직접 입력"
++msgstr ""
++
++#: src/advanced_settings.py:95
++msgid "진단"
++msgstr ""
++
++#: src/advanced_settings.py:96
++msgid "진단 로그"
++msgstr ""
++
++#: src/stream_ingest.py:495
++msgid "진행 중인 YouTube 라이브 방송을 찾지 못했습니다."
++msgstr ""
++
++#: src/workspace_ui.py:528
++msgid "찾은 곡을 이 영상 전체의 챕터로 만듭니다. 클립 파일은 만들지 않습니다."
++msgstr ""
++
++#: src/export_settings.py:82
++msgid "채널"
++msgstr ""
++
++#: src/workspace_ui.py:527
++msgid "챕터"
++msgstr ""
++
++#: src/workspace_ui.py:535 src/workspace_ui.py:537
++msgid "챕터 형식"
++msgstr ""
++
++#: src/chapters.py:59
++#, python-brace-format
++msgid "챕터 형식을 확인해 주세요: {error}"
++msgstr ""
++
++#: src/chapters.py:102
++#, python-brace-format
++msgid "챕터가 {count}개입니다. YouTube는 {least}개부터 표시합니다."
++msgstr ""
++
++#: src/chapters.py:137
++msgid "챕터를 넣는 중입니다…"
++msgstr ""
++
++#: src/app.py:508
++#, python-brace-format
++msgid "챕터를 넣어 저장했습니다: {name}"
++msgstr ""
++
++#: src/app.py:501 src/workspace_ui.py:555
++msgid "챕터를 넣은 영상 저장"
++msgstr ""
++
++#: src/chapters.py:144
++msgid "챕터를 넣은 파일을 만들지 못했습니다."
++msgstr ""
++
++#: src/export_settings.py:74
++msgid "처리 속도"
++msgstr ""
++
++#: src/export_settings.py:33
++msgid "천천히 · 같은 화질에서 용량 절약"
++msgstr ""
++
++#: src/workspace_ui.py:113
++msgid "체크 해제"
++msgstr ""
++
++#: src/app.py:406
++#, python-brace-format
++msgid "체크한 클립 {count}개 저장 설정 →"
++msgid_plural "체크한 클립 {count}개 저장 설정 →"
++msgstr[0] ""
++msgstr[1] ""
++
++#: src/workspace_ui.py:148
++msgid "체크한 클립의 저장 대상과 파일명을 확인합니다."
++msgstr ""
++
++#: src/export_settings.py:46
++#, python-brace-format
++msgid "최대 {h}p"
++msgstr ""
++
++#: src/advanced_settings.py:156
++#, python-brace-format
++msgid "최신 버전입니다. 현재 버전 {name}"
++msgstr ""
++
++#: src/app.py:765 src/app.py:813 src/app.py:881 src/export_settings.py:147 src/profile_panel.py:258 src/profile_panel.py:409 src/setup_dialog.py:88 src/setup_dialog.py:111 src/setup_dialog.py:43 src/workspace_ui.py:659
++msgid "취소"
++msgstr ""
++
++#: src/launcher.py:31
++msgid "콘솔과 로그 파일에 진단 정보 기록"
++msgstr ""
++
++#: src/timeline.py:33
++msgid "클릭·드래그: 탐색 | 양끝: 트리밍 | Ctrl+드래그: 구간 이동\n휠: 시간축 이동 | Ctrl+휠: 확대 | 중간 버튼 드래그: 이동 | Alt: 스냅 해제"
++msgstr ""
++
++#: src/workspace_ui.py:499
++msgid "클립"
++msgstr ""
++
++#: src/app.py:432
++#, python-brace-format
++msgid "클립 {value1}개 · 총 {value2}"
++msgstr ""
++
++#: src/clips.py:72
++msgid "클립 검수 상태를 확인해 주세요."
++msgstr ""
++
++#: src/export.py:122
++msgid "클립 길이에 비해 목표 용량이 너무 작습니다. 용량을 늘려 주세요."
++msgstr ""
++
++#: src/workspace_ui.py:98
++msgid "클립 목록"
++msgstr ""
++
++#: src/workspace_ui.py:118
++msgid "클립 목록 · 체크하여 저장 선택"
++msgstr ""
++
++#: src/workspace_ui.py:421
++msgid "클립 선택·재생 위치를 따라 확대 시간축 이동"
++msgstr ""
++
++#: src/workspace_ui.py:465
++msgid "클립 선택으로 돌아가기"
++msgstr ""
++
++#: src/workspace_ui.py:398
++msgid "클립 시작·끝 일괄 조정"
++msgstr ""
++
++#: src/clips.py:74
++msgid "클립 식별자를 확인해 주세요."
++msgstr ""
++
++#: src/clips.py:81
++msgid "클립 오프셋을 확인해 주세요."
++msgstr ""
++
++#: src/export.py:110
++#, python-brace-format
++msgid "클립 저장 {index:,} / {value2:,} · {name}"
++msgstr ""
++
++#: src/export.py:177
++#, python-brace-format
++msgid "클립 저장 실패 {index:,} / {value2:,} · {error}"
++msgstr ""
++
++#: src/app.py:416
++msgid "클립 저장 폴더"
++msgstr ""
++
++#: src/workspace_ui.py:131
++msgid "클립 직접 추가"
++msgstr ""
++
++#: src/app.py:142 src/workspace_ui.py:59
++msgid "클립 확인"
++msgstr ""
++
++#: src/export_settings.py:70
++msgid "클립당 목표 크기"
++msgstr ""
++
++#: src/export_settings.py:174
++#, python-brace-format
++msgid "클립당 약 {value1:g} MB"
++msgstr ""
++
++#: src/app.py:1200
++msgid "클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다."
++msgstr ""
++
++#: src/app.py:178
++msgid "클립을 선택해 시작과 끝을 확인하세요. 저장할 클립은 체크하세요."
++msgstr ""
++
++#: src/app.py:410
++msgid "클립이 없습니다. 인식 영역에서 곡을 찾거나 클립을 직접 추가하세요."
++msgstr ""
++
++#: src/workspace_ui.py:272
++msgid "키 복사"
++msgstr ""
++
++#: src/app.py:444
++#, python-brace-format
++msgid "파일 {count}개 저장 시작"
++msgid_plural "파일 {count}개 저장 시작"
++msgstr[0] ""
++msgstr[1] ""
++
++#: src/app.py:142 src/workspace_ui.py:59
++msgid "파일 저장"
++msgstr ""
++
++#: src/workspace_ui.py:521
++msgid "파일 저장 시작"
++msgstr ""
++
++#: src/workspace_ui.py:92
++msgid "파일 추가"
++msgstr ""
++
++#: src/export_settings.py:69
++msgid "파일 형식"
++msgstr ""
++
++#: src/export.py:78
++msgid "파일 형식·해상도·프레임·채널 설정을 확인해 주세요."
++msgstr ""
++
++#: src/tool_errors.py:49
++msgid "파일에 접근하지 못했습니다. 파일을 사용 중인 프로그램을 닫고 읽기·쓰기 권한이 있는 폴더를 선택하세요."
++msgstr ""
++
++#: src/workspace_ui.py:84
++msgid "파일이나 폴더를 추가하거나 영상을 여기에 놓으세요."
++msgstr ""
++
++#: src/license_dialog.py:37
++msgid "패키지에 라이선스 정보가 없습니다."
++msgstr ""
++
++#: src/app.py:1626
++msgid "편집 작업 열기"
++msgstr ""
++
++#: src/app.py:1618
++msgid "편집 작업 저장"
++msgstr ""
++
++#: src/app.py:811
++msgid "편집한 내용과 시작·끝 조정을 초기화하고 제거한 클립을 복원합니다. 자동 클립의 저장 체크도 해제합니다. 직접 추가한 클립은 유지합니다."
++msgstr ""
++
++#: src/app.py:175
++msgid "편집할 영상을 선택하세요."
++msgstr ""
++
++#: src/stream_ingest.py:82
++msgid "포트 번호는 1–65535 사이로 지정해 주세요."
++msgstr ""
++
++#: src/app.py:1253 src/workspace_ui.py:285
++msgid "포트포워딩 · 고정 DDNS 가이드"
++msgstr ""
++
++#: src/setup_dialog.py:29 src/workspace_ui.py:511
++msgid "폴더 선택"
++msgstr ""
++
++#: src/workspace_ui.py:93
++msgid "폴더 추가"
++msgstr ""
++
++#: src/app.py:427
++msgid "폴더를 열 수 없습니다. 대상 경로를 확인해 주세요."
++msgstr ""
++
++#: src/app.py:38
++msgid "폴더에서 영상을 찾고 있습니다…"
++msgstr ""
++
++#: src/export_settings.py:73
++msgid "프레임 속도"
++msgstr ""
++
++#: src/media.py:100
++msgid "프레임 시각을 확인해 주세요."
++msgstr ""
++
++#: src/media.py:143
++msgid "프레임을 찾을 수 없습니다."
++msgstr ""
++
++#: src/app.py:1535
++msgid "프로그램을 다시 시작하지 못했습니다. 기존 데이터 폴더를 유지합니다."
++msgstr ""
++
++#: src/workspace_ui.py:279
++msgid "프로토콜"
++msgstr ""
++
++#: src/profiles.py:24
++msgid "프로파일 이름을 입력해 주세요."
++msgstr ""
++
++#: src/profiles.py:21
++msgid "프로파일 형식을 확인해 주세요."
++msgstr ""
++
++#: src/profile_panel.py:360
++msgid "프로필 (*.json *.zip)"
++msgstr ""
++
++#: src/profile_panel.py:374
++#, python-brace-format
++msgid "프로필 {value1}개를 가져왔습니다."
++msgstr ""
++
++#: src/profile_panel.py:46 src/profile_panel.py:360 src/profile_panel.py:376 src/profile_panel.py:365
++msgid "프로필 가져오기"
++msgstr ""
++
++#: src/profile_panel.py:45
++msgid "프로필 가져오기 (JSON / ZIP)"
++msgstr ""
++
++#: src/profile_panel.py:381 src/profile_panel.py:106 src/profile_panel.py:389
++msgid "프로필 내보내기"
++msgstr ""
++
++#: src/profile_panel.py:317
++msgid "프로필 변경"
++msgstr ""
++
++#: src/profile_panel.py:285 src/profile_panel.py:340
++msgid "프로필 선택"
++msgstr ""
++
++#: src/profiles.py:125
++msgid "프로필 압축 파일을 읽을 수 없습니다."
++msgstr ""
++
++#: src/profile_panel.py:51 src/profile_panel.py:52 src/profile_panel.py:394
++msgid "프로필 이름"
++msgstr ""
++
++#: src/profile_panel.py:106 src/profile_panel.py:357
++msgid "프로필 저장"
++msgstr ""
++
++#: src/app.py:1649
++msgid "프로필 파일 이름을 확인해 주세요."
++msgstr ""
++
++#: src/profiles.py:104
++msgid "프로필 파일이 너무 큽니다."
++msgstr ""
++
++#: src/app.py:177
++msgid "프로필을 선택하거나, 지정할 영역을 고르고 영상에서 드래그하세요."
++msgstr ""
++
++#: src/profile_panel.py:355
++msgid "프로필을 저장했습니다."
++msgstr ""
++
++#: src/profile_panel.py:405
++msgid "프로필의 변경 내용을 어떻게 처리할까요?"
++msgstr ""
++
++#: src/export_settings.py:108
++msgid "프리셋 적용"
++msgstr ""
++
++#: src/export_settings.py:130
++msgid "프리셋을 선택했습니다. 적용 버튼을 눌러 설정에 반영하세요."
++msgstr ""
++
++#: src/workspace_ui.py:100
++msgid "플레이어 이름 검색"
++msgstr ""
++
++#: src/profiles.py:16
++msgid "필수 영역을 지정해 주세요: "
++msgstr ""
++
++#: src/tool_errors.py:57
++msgid "필요한 파일을 찾지 못했습니다. 원본 영상과 저장 폴더가 이동되거나 삭제되지 않았는지 확인하세요."
++msgstr ""
++
++#: src/clips.py:77
++msgid "합친 클립의 식별자를 확인해 주세요."
++msgstr ""
++
++#: src/media.py:116 src/youtube_preview.py:100
++msgid "해당 시각의 프레임을 찾을 수 없습니다."
++msgstr ""
++
++#: src/export_settings.py:72
++msgid "해상도"
++msgstr ""
++
++#: src/app.py:247
++#, python-brace-format
++msgid "현재 단계 예상 남은 시간: 약 {time}"
++msgstr ""
++
++#: src/advanced_settings.py:60
++msgid "현재 데이터 폴더"
++msgstr ""
++
++#: src/advanced_settings.py:129
++#, python-brace-format
++msgid "현재 버전 {name}"
++msgstr ""
++
++#: src/tool_errors.py:41
++msgid "현재 사용할 수 없는 영상입니다. 브라우저에서 영상 공개 상태와 재생 가능 여부를 확인하세요."
++msgstr ""
++
++#: src/export_settings.py:127
++msgid "현재 설정: 사용자 지정"
++msgstr ""
++
++#: src/export_settings.py:127
++msgid "현재 설정: 원본 빠른 복사"
++msgstr ""
++
++#: src/workspace_ui.py:26
++msgid "현재 영상"
++msgstr ""
++
++#: src/workspace_ui.py:30
++msgid "현재 영상 전환 · 클립은 영상별로 관리"
++msgstr ""
++
++#: src/app.py:577
++msgid "현재 영상에서 저장할 클립을 선택하세요."
++msgstr ""
++
++#: src/workspace_ui.py:417
++msgid "현재 영상의 삭제·편집한 자동 클립을 원본으로 복원합니다. 직접 추가한 클립은 유지합니다."
++msgstr ""
++
++#: src/workspace_ui.py:407
++msgid "현재 영상의 자동 인식 결과 기준\n−: 앞당김 / +: 늦춤"
++msgstr ""
++
++#: src/app.py:810
++msgid "현재 영상의 자동 인식 클립을 복원할까요?"
++msgstr ""
++
++#: src/workspace_ui.py:361 src/youtube_preview.py:154
++msgid "현재 위치를 끝으로"
++msgstr ""
++
++#: src/workspace_ui.py:360 src/youtube_preview.py:153
++msgid "현재 위치를 시작으로"
++msgstr ""
++
++#: src/app.py:1524
++msgid "현재 작업은 기존 폴더에 보관됩니다. 새 폴더 준비가 끝나면 프로그램을 다시 시작합니다."
++msgstr ""
++
++#: src/live.py:70 src/live.py:105 src/live_dvr.py:130
++msgid "현재 접근 가능한 라이브 구간이 없습니다."
++msgstr ""
++
++#: src/profile_panel.py:99
++msgid "현재 지정 영역"
++msgstr ""
++
++#: src/workspace_ui.py:397
++msgid "현재 클립"
++msgstr ""
++
++#: src/workspace_ui.py:147
++msgid "현재 필터로 보이는 클립의 저장 설정을 엽니다."
++msgstr ""
++
++#: src/workspace_ui.py:395
++msgid "현재 화면 인식 확인"
++msgstr ""
++
++#: src/profile_panel.py:214
++msgid "화면 비율이 바뀌었습니다. 인식 영역을 선택해 주세요."
++msgstr ""
++
++#: src/advanced_settings.py:51
++msgid "화면 탐색"
++msgstr ""
++
++#: src/export_settings.py:55
++msgid "화질 우선 · 용량 자동"
++msgstr ""
++
++#: src/export_settings.py:71
++msgid "화질과 용량"
++msgstr ""
++
++#: src/workspace_ui.py:195
++msgid "확대 시간축 가로 이동"
++msgstr ""
++
++#: src/app.py:1575
++msgid "확인 실패"
++msgstr ""
++
++#: src/workspace_ui.py:49
++msgid "확인 중…"
++msgstr ""
++
++#: src/setup_dialog.py:18
++msgid "환영합니다"
++msgstr ""
+diff --git "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\arcadeclip.po" "b/src\\locales\\en\\LC_MESSAGES\\arcadeclip.po"
+index 83ebbaf..4c05aed 100644
+--- "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\arcadeclip.po"
++++ "b/src\\locales\\en\\LC_MESSAGES\\arcadeclip.po"
+@@ -2895,3 +2895,224 @@ msgstr "Overlap decoding, conversion, and recognition"
+ msgid "대기 프레임 수를 제한합니다. 기존 CPU 경계 버퍼 사용 시 순차 처리합니다."
+ msgstr "Bounds queued frames. Runs sequentially when the CPU boundary buffer is active."
+ 
++msgid "스트림 키를 복사했습니다."
++msgstr "Copied the stream key."
++
++msgid "OBS 서버 주소를 복사했습니다."
++msgstr "Copied the OBS server URL."
++
++msgid "새 스트림 키를 발급했습니다."
++msgstr "Generated a new stream key."
++
++msgid "포트포워딩 · 고정 DDNS 가이드"
++msgstr "Port forwarding & static DDNS guide"
++
++msgid "안내문 복사"
++msgstr "Copy guide"
++
++msgid "고정 주소(DDNS 또는 IP)와 스트림 키 형식을 확인해 주세요."
++msgstr "Check the static address (DDNS or IP) and stream key format."
++
++msgid "스트림 자동 저장 및 클립 {count:,}개 추출 완료"
++msgstr "Saved stream and automatically exported {count:,} clips"
++
++msgid "스트림 자동 저장 완료: {name}"
++msgstr "Saved stream automatically: {name}"
++
++msgid ""
++"[선택지 A · 직접 스트림 수신을 위한 포트포워딩 및 고정 DDNS 가이드]\n\n"
++"외부망(오락실 PC)에서 이 PC로 직접 스트림을 보내려면 공유기 포트포워딩과 고정 DDNS 주소가 필요합니다.\n"
++"(만약 공유기 설정이 어려운 휴대용 핫스팟 환경이라면 [방식 B: YouTube 라이브 자동 감지]를 선택하세요.)\n\n"
++"■ 현재 이 PC의 네트워크 정보\n"
++"• 내부 IP 주소 (포트포워딩 대상): {lan_ip}\n"
++"• 개방할 프로토콜 및 포트: {transport} {port}번\n\n"
++"■ STEP 1. 고정 DDNS 주소 발급 (공인 IP가 바뀌어도 주소 고정)\n"
++"1) ipTIME 공유기 사용 시:\n"
++"   • 브라우저에서 http://192.168.0.1 접속 → [고급 설정] → [특수기능] → [DDNS 설정]\n"
++"   • 호스트 이름(예: myarcade.iptime.org)과 사용자 ID(이메일) 입력 후 [추가] 클릭\n"
++"2) 통신사 공유기(KT·SKB·LGU+) 또는 일반 공유기 사용 시:\n"
++"   • 무료 DDNS 서비스인 DuckDNS(https://www.duckdns.org) 또는 No-IP에서 무료 도메인 발급\n"
++"   • 발급받은 도메인 주소를 이 프로그램의 [고정 주소 (DDNS/IP)] 칸에 입력\n\n"
++"■ STEP 2. 공유기 포트포워딩 설정\n"
++"1) 공유기 설정 페이지 접속 → [고급 설정] → [NAT/라우터 관리] → [포트포워드 설정]\n"
++"2) 새 규칙 추가:\n"
++"   • 내부 IP 주소: {lan_ip}\n"
++"   • 프로토콜: {transport}\n"
++"   • 외부 포트: {port} ~ {port} / 내부 포트: {port} ~ {port}\n\n"
++"■ STEP 3. 오락실 OBS (추가 스트림) 입력값\n"
++"• 서버(Server): {server_url}\n"
++"• 스트림 키(Stream Key): {key}\n"
++"• 한 번만 등록해 두면 오락실에서 스트림 소스를 켜고 끌 때마다 자동으로 원본 저장 및 클립 추출이 진행됩니다."
++msgstr ""
++"[Option A · Port Forwarding and Static DDNS Guide for Direct Stream Ingest]\n\n"
++"Receiving a stream directly from an external network (arcade PC) requires router port forwarding and a static DDNS address.\n"
++"(If you are on a mobile hotspot where router setup is unavailable, choose [Option B: YouTube Live Auto-Watch].)\n\n"
++"■ Network Information for This PC\n"
++"• Internal LAN IP (port forwarding target): {lan_ip}\n"
++"• Protocol and port to open: {transport} port {port}\n\n"
++"■ STEP 1. Get a Static DDNS Address (Keep the same address when public IP changes)\n"
++"1) ipTIME routers:\n"
++"   • Open http://192.168.0.1 in a browser → [Advanced] → [Special Features] → [DDNS Settings]\n"
++"   • Enter a hostname (e.g. myarcade.iptime.org) and user ID (email), then click [Add]\n"
++"2) ISP or other routers:\n"
++"   • Register a free domain with DuckDNS (https://www.duckdns.org) or No-IP\n"
++"   • Enter that domain into the [Static address (DDNS/IP)] field in this app\n\n"
++"■ STEP 2. Configure Router Port Forwarding\n"
++"1) Open your router admin page → [Advanced] → [NAT/Router] → [Port Forwarding]\n"
++"2) Add a new rule:\n"
++"   • Internal IP address: {lan_ip}\n"
++"   • Protocol: {transport}\n"
++"   • External port: {port} ~ {port} / Internal port: {port} ~ {port}\n\n"
++"■ STEP 3. Arcade OBS (Extra Stream) Settings\n"
++"• Server: {server_url}\n"
++"• Stream Key: {key}\n"
++"• Once registered, toggling the stream source on and off at the arcade automatically saves the recording and exports clips."
++
++msgid "YouTube 라이브 또는 채널 주소(@핸들/live)를 입력해 주세요."
++msgstr "Enter a YouTube live URL or channel live address (@handle/live)."
++
++msgid "스트림 키는 영문·숫자·하이픈(-)으로 4–64자를 입력해 주세요."
++msgstr "Enter a stream key of 4–64 letters, digits, or hyphens (-)."
++
++msgid "고정 주소(DDNS 또는 IP) 형식을 확인해 주세요."
++msgstr "Check the static address (DDNS or IP) format."
++
++msgid "지원하지 않는 스트림 프로토콜입니다."
++msgstr "Unsupported stream protocol."
++
++msgid "포트 번호는 1–65535 사이로 지정해 주세요."
++msgstr "Choose a port number between 1 and 65535."
++
++msgid "재연결 대기 시간은 0–600초 사이로 지정해 주세요."
++msgstr "Choose a reconnect grace period between 0 and 600 seconds."
++
++msgid "OBS 스트림 수신 대기 중 · {url} (스트림 키: {key})"
++msgstr "Waiting for OBS stream · {url} (stream key: {key})"
++
++msgid "OBS 스트림 저장 완료 · {path}"
++msgstr "OBS stream saved · {path}"
++
++msgid "감지 주기는 1–300초 사이로 지정해 주세요."
++msgstr "Choose a polling interval between 1 and 300 seconds."
++
++msgid "YouTube 스트림 상태를 확인하고 있습니다…"
++msgstr "Checking YouTube stream status…"
++
++msgid "방송 시작 대기 중 · {seconds:g}초 후 다시 확인합니다…"
++msgstr "Waiting for broadcast to start · checking again in {seconds:g}s…"
++
++msgid "스트림 신호 끊김 · {seconds}초 동안 재연결을 대기합니다 (LTE 일시 끊김 보호)…"
++msgstr "Stream signal interrupted · waiting {seconds}s for reconnect (LTE drop protection)…"
++
++msgid "재연결된 스트림 조각 {count}개를 하나로 합치고 있습니다…"
++msgstr "Merging {count} reconnected stream segments into one recording…"
++
++msgid "수신한 스트림 영상의 길이를 확인할 수 없습니다."
++msgstr "Could not determine the duration of the received stream recording."
++
++msgid "진행 중인 YouTube 라이브 방송을 찾지 못했습니다."
++msgstr "Could not find an active YouTube live broadcast."
++
++msgid "스트림 연결을 확인하지 못했습니다. 포트포워딩과 스트림 키를 확인해 주세요."
++msgstr "Could not verify an incoming stream connection. Check port forwarding and the stream key."
++
++msgid "OBS 스트림 수신 및 자동 저장 중 · {elapsed:.1f}초"
++msgstr "Receiving and saving OBS stream · {elapsed:.1f}s"
++
++msgid "라이브 감지됨: {title} · 현재 {seconds:.1f}초 · 송출 종료 시 자동 다운로드합니다."
++msgstr "Live broadcast detected: {title} · {seconds:.1f}s elapsed · will download automatically when stream ends."
++
++msgid "OBS 스트림 자동 클립"
++msgstr "OBS stream auto-clip"
++
++msgid "선택지 A · 직접 수신 (RTMP/SRT)"
++msgstr "Option A · Direct ingest (RTMP/SRT)"
++
++msgid "선택지 B · YouTube 라이브 자동 감지"
++msgstr "Option B · YouTube live auto-watch"
++
++msgid "RTMP (1935 · 기본)"
++msgstr "RTMP (1935 · default)"
++
++msgid "SRT (9000 · LTE 끊김 방어)"
++msgstr "SRT (9000 · LTE drop protection)"
++
++msgid "키 복사"
++msgstr "Copy key"
++
++msgid "재발급"
++msgstr "Regenerate"
++
++msgid "서버 복사"
++msgstr "Copy server"
++
++msgid "프로토콜"
++msgstr "Protocol"
++
++msgid "수신 포트"
++msgstr "Listen port"
++
++msgid "고정 주소 (DDNS/IP)"
++msgstr "Static address (DDNS/IP)"
++
++msgid "LTE 재연결 대기"
++msgstr "LTE reconnect wait"
++
++msgid "스트림 키"
++msgstr "Stream key"
++
++msgid "OBS 서버 주소"
++msgstr "OBS server URL"
++
++msgid "송출 종료 시 전체 구간 다운로드"
++msgstr "Download full range when broadcast ends"
++
++msgid "감시 주소"
++msgstr "Watch URL"
++
++msgid "감지 주기"
++msgstr "Check interval"
++
++msgid "수신 후 자동으로 곡 분석 및 클립 저장"
++msgstr "Analyze songs and export clips automatically after receiving"
++
++msgid "스트림 자동 수신 시작"
++msgstr "Start automatic stream ingest"
++
++msgid "개별 라이브 녹화 시작"
++msgstr "Start individual live recording"
++
++msgid "링크 붙여넣기"
++msgstr "Paste link"
++
++msgid "시작~정지 누른 구간만 부분 녹화 (개별 라이브용)"
++msgstr "Record only the Start-to-Stop interval (for individual live streams)"
++
++msgid "수신 정지 · 클립 생성"
++msgstr "Stop ingest & create clips"
++
++msgid "클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다."
++msgstr "No valid YouTube live or channel URL found in the clipboard."
++
++msgid "개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작]과 [수신 정지 · 클립 생성]으로 원하는 구간을 녹화할 수 있습니다."
++msgstr "Pasted individual YouTube live link. Use [Start individual live recording] and [Stop ingest & create clips] to record your desired section."
++
++msgid "YouTube 채널 라이브 주소를 붙여넣었습니다."
++msgstr "Pasted YouTube channel live URL."
++
++msgid "수신을 정지하고 현재까지 녹화된 구간으로 클립 생성을 시작합니다…"
++msgstr "Stopping ingest and starting clip generation from the recorded section…"
++
++msgid "수신된 스트림 영상이 없어 작업을 종료했습니다."
++msgstr "Ended because no stream video was received."
++
++msgid "수신 정지 요청됨 · 현재 시점까지의 라이브 구간을 다운로드합니다…"
++msgstr "Stop requested · downloading the live section up to the current point…"
++
++msgid "라이브 녹화 추적 중: {title} · 구간 {start:.1f}초 ~ {seconds:.1f}초 · [수신 정지] 또는 방송 종료 시 클립을 생성합니다."
++msgstr "Tracking live recording: {title} · {start:.1f}s ~ {seconds:.1f}s · clips will be generated on [Stop ingest] or broadcast end."
++
++msgid "수신된 YouTube 라이브 구간이 없어 작업을 종료했습니다."
++msgstr "Ended because no YouTube live section was received."
++
++
+diff --git "a/src\\tests\\test_stream_ingest.py" "b/src\\tests\\test_stream_ingest.py"
+new file mode 100644
+index 0000000..3ae5542
+--- /dev/null
++++ "b/src\\tests\\test_stream_ingest.py"
+@@ -0,0 +1,268 @@
++"""Tests for OBS stream-key ingest (Option A direct RTMP/SRT and Option B YouTube live watch) and auto-clipping."""
++import json
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++
++import stream_ingest
++
++
++class StreamIngestTests(unittest.TestCase):
++    def test_stream_key_and_obs_connection_info(self):
++        key = stream_ingest.generate_stream_key()
++        self.assertRegex(key, r"^ac-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}$")
++        self.assertEqual(stream_ingest.validate_stream_key(f"  {key}  "), key)
++
++        for bad_key in ("", "ab", "bad key", "ac/../secret", "a" * 65, None):
++            with self.assertRaises(ValueError):
++                stream_ingest.validate_stream_key(bad_key)
++
++        self.assertEqual(stream_ingest.validate_host(""), "127.0.0.1")
++        self.assertEqual(stream_ingest.validate_host("myarcade.iptime.org"), "myarcade.iptime.org")
++        for bad_host in ("http://example.com", "my..host.com", "-bad.host", "bad.host.", "a/b"):
++            with self.assertRaises(ValueError):
++                stream_ingest.validate_host(bad_host)
++
++        rtmp = stream_ingest.obs_connection_info("rtmp", "myarcade.iptime.org", 1935, key)
++        self.assertEqual(rtmp["server_url"], "rtmp://myarcade.iptime.org:1935/live2")
++        self.assertEqual(rtmp["listen_url"], f"rtmp://0.0.0.0:1935/live2/{key}")
++
++        srt = stream_ingest.obs_connection_info("srt", "myarcade.duckdns.org", 9000, key)
++        self.assertEqual(
++            srt["server_url"],
++            f"srt://myarcade.duckdns.org:9000?streamid={key}&latency=2500000",
++        )
++        self.assertEqual(
++            srt["listen_url"],
++            f"srt://0.0.0.0:9000?mode=listener&streamid={key}&latency=2500000",
++        )
++
++    def test_port_forwarding_and_ddns_guide_includes_network_details(self):
++        with patch.object(stream_ingest, "local_lan_ip", return_value="192.168.0.42"):
++            guide = stream_ingest.port_forwarding_guide(
++                "rtmp", 1935, "myarcade.iptime.org", "ac-1234-5678-90ab"
++            )
++        self.assertIn("192.168.0.42", guide)
++        self.assertIn("TCP", guide)
++        self.assertIn("1935", guide)
++        self.assertIn("DDNS", guide)
++        self.assertIn("rtmp://myarcade.iptime.org:1935/live2", guide)
++        self.assertIn("ac-1234-5678-90ab", guide)
++
++    def test_youtube_stream_target_accepts_channels_and_videos(self):
++        self.assertEqual(
++            stream_ingest.youtube_stream_target("@arcade_player"),
++            "https://www.youtube.com/@arcade_player/live",
++        )
++        self.assertEqual(
++            stream_ingest.youtube_stream_target("https://www.youtube.com/@arcade_player/live"),
++            "https://www.youtube.com/@arcade_player/live",
++        )
++        self.assertEqual(
++            stream_ingest.youtube_stream_target(
++                "https://www.youtube.com/channel/UC1234567890abcdefghijkl/live"
++            ),
++            "https://www.youtube.com/channel/UC1234567890abcdefghijkl/live",
++        )
++        self.assertEqual(
++            stream_ingest.youtube_stream_target("https://youtu.be/abcdefghijk"),
++            "https://www.youtube.com/watch?v=abcdefghijk",
++        )
++        for invalid in ("", "https://evil.com/@arcade/live", "https://www.youtube.com/playlist?list=1"):
++            with self.assertRaises(ValueError):
++                stream_ingest.youtube_stream_target(invalid)
++
++    def test_receive_direct_stream_coalesces_lte_reconnect_parts(self):
++        calls = []
++
++        def fake_listen(ffmpeg, info, part_path, cancel, report, *, idle_timeout=None):
++            calls.append((part_path.name, idle_timeout))
++            if len(calls) in (1, 2):
++                part_path.write_bytes(b"ts-segment-" + str(len(calls)).encode("ascii"))
++                return True
++            return False
++
++        def fake_concat(args, cancel, report, *, cwd=None, **kwargs):
++            output_path = Path(args[-1])
++            output_path.write_bytes(b"merged-ts-stream")
++            return ""
++
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            with patch.object(stream_ingest, "find_tool", return_value="/tools/ffmpeg"), \
++                    patch.object(stream_ingest, "_listen_part", side_effect=fake_listen), \
++                    patch.object(stream_ingest, "run_command", side_effect=fake_concat) as run_cmd, \
++                    patch.object(stream_ingest, "_media_duration", return_value=185.5):
++                saved = stream_ingest.receive_direct_stream(
++                    "srt", 9000, "ac-1111-2222-3333", root, threading.Event(), lambda _: None,
++                    host="myarcade.duckdns.org", grace_seconds=45,
++                )
++            self.assertTrue(saved.is_file())
++            self.assertEqual(saved.read_bytes(), b"merged-ts-stream")
++            self.assertEqual(calls, [("part_001.ts", None), ("part_002.ts", 45), ("part_003.ts", 45)])
++            run_cmd.assert_called_once()
++            meta = json.loads((saved.parent / "source.json").read_text(encoding="utf-8"))
++            self.assertEqual(meta["parts_count"], 2)
++            self.assertEqual(meta["protocol"], "srt")
++            self.assertEqual(meta["local_duration"], 185.5)
++
++    def test_watch_youtube_stream_tracks_live_snapshot_and_downloads_on_end(self):
++        live_meta = {
++            "url": "https://www.youtube.com/watch?v=abcdefghijk",
++            "id": "abcdefghijk",
++            "title": "Arcade Session",
++            "is_live": True,
++            "duration": 240.0,
++            "window": {"duration": 240.0},
++        }
++        states = [live_meta, None]
++
++        def fake_inspect(url, cancel, report):
++            item = states.pop(0)
++            if item is None:
++                raise RuntimeError("Broadcast entered post_live state")
++            return item
++
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            expected_file = root / "youtube-session" / "video.mkv"
++            expected_file.parent.mkdir(parents=True)
++            expected_file.write_bytes(b"video")
++            with patch.object(
++                stream_ingest, "_resolve_youtube_video_url",
++                return_value="https://www.youtube.com/watch?v=abcdefghijk",
++            ), patch.object(
++                stream_ingest, "inspect_source", side_effect=fake_inspect,
++            ), patch.object(
++                stream_ingest, "download_section", return_value=expected_file,
++            ) as dl:
++                result = stream_ingest.watch_youtube_stream(
++                    "https://www.youtube.com/@arcade_player/live",
++                    root,
++                    threading.Event(),
++                    lambda _: None,
++                    poll_seconds=1,
++                    workers=4,
++                    wait_for_end=True,
++                )
++            self.assertEqual(result["path"], expected_file)
++            self.assertEqual(result["end"], 240.0)
++            dl.assert_called_once()
++            self.assertEqual(dl.call_args.kwargs["snapshot"], live_meta)
++
++    def test_watch_individual_youtube_live_start_and_manual_stop_slices_interval(self):
++        self.assertTrue(stream_ingest.is_individual_youtube_live_url("https://www.youtube.com/watch?v=abcdefghijk"))
++        self.assertTrue(stream_ingest.is_individual_youtube_live_url("https://youtube.com/live/abcdefghijk"))
++        self.assertFalse(stream_ingest.is_individual_youtube_live_url("https://www.youtube.com/@arcade_player/live"))
++
++        stop_event = threading.Event()
++        first_meta = {
++            "url": "https://www.youtube.com/watch?v=abcdefghijk",
++            "id": "abcdefghijk",
++            "title": "Individual Live",
++            "is_live": True,
++            "duration": 600.0,
++            "window": {"duration": 600.0, "start_utc": 1700000000.0},
++        }
++        second_meta = {
++            "url": "https://www.youtube.com/watch?v=abcdefghijk",
++            "id": "abcdefghijk",
++            "title": "Individual Live",
++            "is_live": True,
++            "duration": 840.0,
++            "window": {"duration": 840.0, "start_utc": 1700000000.0},
++        }
++        snapshots = [first_meta, second_meta]
++
++        def fake_inspect(url, cancel, report):
++            current = snapshots.pop(0)
++            if not snapshots:
++                stop_event.set()
++            return current
++
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            expected_file = root / "youtube-session" / "video.mkv"
++            expected_file.parent.mkdir(parents=True)
++            expected_file.write_bytes(b"video")
++            with patch.object(
++                stream_ingest, "inspect_source", side_effect=fake_inspect,
++            ), patch.object(
++                stream_ingest, "download_section", return_value=expected_file,
++            ) as dl:
++                result = stream_ingest.watch_youtube_stream(
++                    "https://www.youtube.com/watch?v=abcdefghijk",
++                    root,
++                    threading.Event(),
++                    lambda _: None,
++                    poll_seconds=1,
++                    workers=4,
++                    wait_for_end=True,
++                    stop_event=stop_event,
++                    from_start_click=True,
++                )
++            self.assertEqual(result["path"], expected_file)
++            self.assertEqual(result["start"], 600.0)
++            self.assertEqual(result["end"], 840.0)
++            self.assertTrue(result.get("stopped"))
++            dl.assert_called_once()
++            self.assertEqual(dl.call_args.args[1], 600.0)
++            self.assertEqual(dl.call_args.args[2], 840.0)
++
++    def test_auto_clip_session_analyzes_applies_offsets_and_exports(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            video = root / "stream.ts"
++            video.write_bytes(b"stream")
++            out_dir = root / "clips"
++            profile = {
++                "version": 1,
++                "name": "Arcade",
++                "size": [1920, 1080],
++                "regions": {
++                    "jacket": [0.1, 0.1, 0.3, 0.3],
++                    "achievement": [0.4, 0.4, 0.6, 0.5],
++                    "player": [0.4, 0.5, 0.6, 0.6],
++                },
++                "recognition": {},
++            }
++            fake_analysis = {
++                "profile": profile,
++                "warnings": [],
++                "cancelled": False,
++                "clips": [
++                    {
++                        "source": str(video),
++                        "start": 20.0,
++                        "end": 140.0,
++                        "title": "Test Song",
++                        "image_url": "song1.png",
++                        "player": "PLAYER1",
++                        "achievement": 100.5,
++                        "reviewed": False,
++                    }
++                ],
++            }
++            with patch.object(stream_ingest, "_media_duration", return_value=200.0), \
++                    patch.object(stream_ingest, "analyze", return_value=fake_analysis) as mock_analyze, \
++                    patch.object(
++                        stream_ingest, "export_clips",
++                        return_value={"saved": [str(out_dir / "clip1.mp4")], "failed": [], "cancelled": False},
++                    ) as mock_export:
++                outcome = stream_ingest.auto_clip_session(
++                    video, profile, root, out_dir, threading.Event(), lambda _: None,
++                    start_offset=-5.0, end_offset=8.0, export_settings={"mode": "fast"},
++                )
++            mock_analyze.assert_called_once()
++            mock_export.assert_called_once()
++            exported_rows = mock_export.call_args.args[0]
++            self.assertEqual(len(exported_rows), 1)
++            self.assertAlmostEqual(exported_rows[0]["start"], 15.0)
++            self.assertAlmostEqual(exported_rows[0]["end"], 148.0)
++            self.assertEqual(len(outcome["exported"]["saved"]), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\test_app.py" "b/src\\tests\\test_app.py"
+index ea769ab..fd4cb2f 100644
+--- "a/C:\\Users\\kghbs\\AppData\\Local\\Temp\\tmpfei340t5\\test_app.py"
++++ "b/src\\tests\\test_app.py"
+@@ -1535,5 +1535,55 @@ print('setup cycles passed')
+                 catalog.assert_not_called()
+             dialog.close()
+ 
++    def test_window_stream_controls_and_completion_flow(self):
++        from PySide6.QtCore import QSettings
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            settings = QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat)
++            with patch.object(MainWindow, "refresh_catalog_summary"), \
++                    patch("workspace_ui.QSettings", return_value=settings), \
++                    patch("app.QSettings", return_value=settings), \
++                    patch.object(MainWindow, "select_file"):
++                window = MainWindow(root)
++                self.assertEqual(window.stream_port.value(), 1935)
++                window.stream_protocol.setCurrentIndex(1)
++                self.assertEqual(window.stream_port.value(), 9000)
++                window.stream_host.setText("myarcade.iptime.org")
++                self.assertIn("srt://myarcade.iptime.org:9000", window.stream_server_url.text())
++
++                QApplication.clipboard().setText("https://www.youtube.com/watch?v=abcdefghijk")
++                window.paste_obs_youtube_url()
++                self.assertEqual(window.stream_mode.currentData(), "youtube")
++                self.assertEqual(window.stream_youtube_url.text(), "https://www.youtube.com/watch?v=abcdefghijk")
++                self.assertEqual(window.stream_start_button.text(), "개별 라이브 녹화 시작")
++                self.assertFalse(window.stream_stop_button.isEnabled())
++
++                video = root / "stream.ts"
++                video.write_bytes(b"video")
++                clip = {
++                    "clip_id": "clip1",
++                    "source": str(video),
++                    "start": 10.0,
++                    "end": 120.0,
++                    "title": "Song A",
++                    "image_url": "song_a.png",
++                    "player": "P1",
++                    "achievement": 100.1234,
++                    "selected": True,
++                }
++                window.stream_ingest_finished({
++                    "path": video,
++                    "duration": 150.0,
++                    "metadata": {"title": "OBS SRT Stream", "video_date": "2026-10-21"},
++                    "originals": [clip],
++                    "clips": [clip],
++                    "exported": {"saved": [str(root / "clip.mp4")], "failed": [], "cancelled": False},
++                })
++                self.assertEqual(window.files.count(), 1)
++                self.assertEqual(len(window.ranges), 1)
++                self.assertEqual(window.stage, 3)
++                window.close()
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,18 +1,23 @@
 """Release lookup and report link: version comparison, response handling, and what is sent."""
+import hashlib
 import json
 from pathlib import Path
+import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
+import zipfile
 
 import updates
 
 
 class FakeResponse:
     def __init__(self, payload, url='https://api.github.com/repos/x/y/releases/latest'):
-        self.body = json.dumps(payload).encode()
+        self.body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.url = url
+        self.headers = {'Content-Length': str(len(self.body))}
+        self._offset = 0
 
     def __enter__(self):
         return self
@@ -24,7 +29,11 @@ class FakeResponse:
         return self.url
 
     def read(self, limit=None):
-        return self.body
+        if limit is None:
+            return self.body
+        chunk = self.body[self._offset:self._offset + limit]
+        self._offset += len(chunk)
+        return chunk
 
 
 class VersionTests(unittest.TestCase):
@@ -78,6 +87,63 @@ class MissingReleaseTests(unittest.TestCase):
         with patch.object(updates.urllib.request, 'urlopen', side_effect=refused):
             with self.assertRaises(urllib.error.HTTPError):
                 updates.latest_release()
+
+
+class SelfUpdateTests(unittest.TestCase):
+    def test_latest_release_info_selects_matching_architecture_installer(self):
+        payload = {
+            'tag_name': 'v0.3.0',
+            'html_url': 'https://github.com/151net/ArcadeClip/releases/tag/v0.3.0',
+            'assets': [
+                {
+                    'name': 'ArcadeClip-0.3.0-windows-x64-setup.exe',
+                    'browser_download_url': 'https://github.com/151net/ArcadeClip/releases/download/v0.3.0/ArcadeClip-0.3.0-windows-x64-setup.exe',
+                },
+                {
+                    'name': 'ArcadeClip-0.3.0-windows-arm64-user-setup.exe',
+                    'browser_download_url': 'https://github.com/151net/ArcadeClip/releases/download/v0.3.0/ArcadeClip-0.3.0-windows-arm64-user-setup.exe',
+                },
+                {
+                    'name': 'ArcadeClip-0.3.0-windows-arm64-user-setup.exe.sha256',
+                    'browser_download_url': 'https://github.com/151net/ArcadeClip/releases/download/v0.3.0/ArcadeClip-0.3.0-windows-arm64-user-setup.exe.sha256',
+                },
+            ],
+        }
+        with patch.object(updates.urllib.request, 'urlopen', return_value=FakeResponse(payload)):
+            info = updates.latest_release_info(arch='ARM64')
+        self.assertEqual(info['tag'], 'v0.3.0')
+        self.assertEqual(info['installer_name'], 'ArcadeClip-0.3.0-windows-arm64-user-setup.exe')
+        self.assertTrue(info['sha256_url'].endswith('.sha256'))
+
+    def test_download_installer_and_prepare_local_update_exe_and_zip(self):
+        fake_exe = b'MZ' + b'\x00' * 128
+        expected_hash = hashlib.sha256(fake_exe).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_root = root / 'app'
+            (app_root / 'src').mkdir(parents=True)
+            with patch.object(
+                updates.urllib.request,
+                'urlopen',
+                return_value=FakeResponse(fake_exe, url='https://example.com/ArcadeClip-setup.exe'),
+            ):
+                downloaded = updates.download_installer(
+                    'https://example.com/ArcadeClip-setup.exe',
+                    root / 'updates',
+                    expected_sha256=expected_hash,
+                )
+            self.assertTrue(downloaded.is_file())
+            exe_res = updates.prepare_local_update(downloaded, app_root=app_root)
+            self.assertEqual(exe_res['mode'], 'installer')
+            self.assertIn('/SILENT', exe_res['args'])
+
+            zip_path = root / 'patch.zip'
+            with zipfile.ZipFile(zip_path, 'w') as zf:
+                zf.writestr('src/updates_marker.py', 'UPDATED = True\n')
+            zip_res = updates.prepare_local_update(zip_path, app_root=app_root)
+            self.assertEqual(zip_res['mode'], 'zip')
+            self.assertEqual(zip_res['updated_files'], 1)
+            self.assertTrue((app_root / 'src' / 'updates_marker.py').is_file())
 
 
 class ReportTests(unittest.TestCase):

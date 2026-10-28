@@ -1,0 +1,91 @@
+{
+  "base_commit": "9110b4d71cda511ac6ee3ed5b165349988de0bdb",
+  "files": [
+    ".github/workflows/release.yml",
+    "docs/develop/PERFORMANCE-X64.md",
+    "run/benchmark_match_reuse.py",
+    "run/build_gpu_roi.py",
+    "run/build_windows.ps1",
+    "run/diagnose_decode_memory.py",
+    "run/gpu_roi.c",
+    "run/pysidedeploy.spec",
+    "run/verify_analysis_options.py",
+    "run/verify_gpu_analysis.py",
+    "run/verify_preview.py",
+    "run/verify_preview_lifecycle.py",
+    "src/advanced_settings.py",
+    "src/app.py",
+    "src/assets/preview.qml",
+    "src/freeplay.py",
+    "src/gpu_image.py",
+    "src/jacket_recognition.py",
+    "src/locales/en/LC_MESSAGES/arcadeclip.mo",
+    "src/locales/en/LC_MESSAGES/arcadeclip.po",
+    "src/media.py",
+    "src/pipeline.py",
+    "src/preview.py",
+    "src/profile_panel.py",
+    "src/profiles.py",
+    "src/recognition.py",
+    "src/tests/test_app.py",
+    "src/tests/test_freeplay.py",
+    "src/tests/test_gpu_image.py",
+    "src/tests/test_pipeline.py",
+    "src/tests/test_preview.py",
+    "src/tests/test_recognition.py",
+    "src/video_sampling.py",
+    "src/workspace_ui.py"
+  ],
+  "patch_sha256": "cfdfc234a379719227aaeec16594befe837fb105465a536954415aca893bddd6",
+  "recognition_patch_unchanged": true,
+  "checks": [
+    {
+      "order": "recognition-first",
+      "result": "passed",
+      "directory": "C:\\Users\\kghbs\\Repository\\ArcadeClip\\build\\recognition-first-hc6awn2j"
+    },
+    {
+      "order": "performance-first",
+      "result": "passed",
+      "directory": "C:\\Users\\kghbs\\Repository\\ArcadeClip\\build\\performance-first-b4oxr__d"
+    }
+  ],
+  "standalone_performance": "passed",
+  "combined_sources_identical": true,
+  "x64_native_runtime": "not tested",
+  "x64_release_build": "not run",
+  "application_tool_checks": [
+    {
+      "order": [
+        "performance",
+        "recognition"
+      ],
+      "idempotency": "passed",
+      "unknown_edits_protected": true
+    },
+    {
+      "order": [
+        "recognition",
+        "performance"
+      ],
+      "idempotency": "passed",
+      "unknown_edits_protected": true
+    },
+    {
+      "order": [
+        "both"
+      ],
+      "idempotency": "passed",
+      "unknown_edits_protected": true
+    }
+  ],
+  "combined_regression_tests": {
+    "passed": 43,
+    "runtime": "ARM64 Python; isolated applied source tree; x64 GPU tests not run"
+  },
+  "x64_helper_cross_compile": "passed using Zig; x64 PE machine verified, not native GPU execution",
+  "standalone_regression_tests": {
+    "passed": 35,
+    "runtime": "ARM64 Python; isolated performance-only source; x64 GPU not exercised"
+  }
+}

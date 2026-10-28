@@ -4,9 +4,9 @@ import math
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QUrl, Signal, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QVideoFrame
 from PySide6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QSlider, QProxyStyle, QStyle, QVBoxLayout, QWidget
 
 
@@ -22,13 +22,31 @@ class SeekSliderStyle(QProxyStyle):
         return super().styleHint(hint, option, widget, returnData)
 
 
+class _VideoOverlay(QWidget):
+    """Widget annotations above the GPU surface, without intercepting input."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def paintEvent(self, event):
+        self.parent().paint_canvas(QPainter(self), video=False)
+
+
 class VideoCanvas(QWidget):
     regionChanged = Signal(str, object)
     editStarted = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.image = QImage()
+        self._image = QImage()
+        self._frame = QVideoFrame()
+        self.image_size = QSize()
+        self.snapshot_count = 0
+        self.video_widget = None
+        self.video_sink = None
+        self.overlay = None
         self.regions = {}
         self.kind = ""
         self.show_regions = True
@@ -51,6 +69,68 @@ class VideoCanvas(QWidget):
         self.controls_hint.hide()
         QApplication.instance().installEventFilter(self)
 
+    def enable_video(self):
+        """Use Qt's GPU renderer; keep headless/software execution available."""
+        if (os.environ.get("ARCADECLIP_PREVIEW_RENDERER") == "software"
+                or QApplication.platformName() in ("offscreen", "minimal")):
+            return
+        from PySide6.QtQuickWidgets import QQuickWidget
+        widget = QQuickWidget(self)
+        widget.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        widget.setSource(QUrl.fromLocalFile(str(Path(__file__).parent / "assets/preview.qml")))
+        if widget.status() == QQuickWidget.Status.Error:
+            import logging
+            logging.getLogger(__name__).warning("GPU preview unavailable: %s", widget.errors())
+            widget.deleteLater()
+            return
+        self.video_widget = widget
+        self.video_sink = widget.rootObject().property("videoSink")
+        self.overlay = _VideoOverlay(self)
+        widget.setGeometry(self.rect())
+        self.overlay.setGeometry(self.rect())
+        widget.show()
+        self.overlay.show()
+        self.controls_hint.raise_()
+
+    @property
+    def image(self):
+        """Materialize a CPU snapshot only when a consumer actually needs pixels."""
+        if self._image.isNull() and self._frame.isValid():
+            image = self._frame.toImage()
+            image = image.transformed(QTransform().rotate(self._frame.rotation().value))
+            if self._frame.mirrored():
+                image = image.mirrored(True, False)
+            self._image = image
+            self.snapshot_count += 1
+        return self._image
+
+    def set_frame(self, frame):
+        previous_size = self.image_size
+        self._frame = QVideoFrame(frame)
+        self._image = QImage()
+        size = frame.surfaceFormat().viewport().size()
+        if size.isEmpty():
+            size = frame.size()
+        rotation = frame.surfaceFormat().rotation().value + frame.rotation().value
+        self.image_size = size.transposed() if rotation % 180 else size
+        # VideoOutput schedules its own GPU rendering. Static annotations do not
+        # need a QWidget repaint for each decoded frame.
+        if self.video_widget is None or self.image_size != previous_size:
+            self.update()
+
+    def update(self, *args):
+        if self.video_widget is not None:
+            rect = self.video_rect()
+            root = self.video_widget.rootObject()
+            for key, value in (("videoX", rect.x()), ("videoY", rect.y()),
+                               ("videoWidth", rect.width()), ("videoHeight", rect.height())):
+                if root.property(key) != value:
+                    root.setProperty(key, value)
+            self.overlay.update()
+        super().update(*args)
+
     def release(self):
         """Stop watching the application's events.
 
@@ -58,6 +138,7 @@ class VideoCanvas(QWidget):
         widget and everything it owns alive for the rest of the run.
         """
         QApplication.instance().removeEventFilter(self)
+        self.set_image(QImage())
 
     def closeEvent(self, event):
         self.release()
@@ -84,15 +165,19 @@ class VideoCanvas(QWidget):
         super().enterEvent(event)
 
     def resizeEvent(self, event):
+        if self.video_widget is not None:
+            self.video_widget.setGeometry(self.rect())
+            self.overlay.setGeometry(self.rect())
+            self.update()
         self.controls_hint.setFixedWidth(max(1, self.width()-28))
         self.controls_hint.adjustSize()
         self.controls_hint.move(14, max(0, self.height()-self.controls_hint.height()-12))
         super().resizeEvent(event)
 
     def video_rect(self):
-        if self.image.isNull():
+        if self.image_size.isEmpty():
             return QRectF()
-        size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        size = self.image_size.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
         width, height = size.width() * self.zoom_scale, size.height() * self.zoom_scale
         return QRectF((self.width() - width) / 2 + self.pan.x(),
                       (self.height() - height) / 2 + self.pan.y(), width, height)
@@ -105,7 +190,7 @@ class VideoCanvas(QWidget):
         self.update()
 
     def zoom(self, factor, anchor=None):
-        if self.image.isNull():
+        if self.image_size.isEmpty():
             return
         anchor = anchor or QPointF(self.rect().center())
         point = self.normalized_point(anchor)
@@ -141,7 +226,11 @@ class VideoCanvas(QWidget):
                        max(0., min(1., (point.y() - rect.y()) / rect.height())))
 
     def set_image(self, image):
-        self.image = image
+        self._frame = QVideoFrame()
+        self._image = image
+        self.image_size = image.size()
+        if self.video_sink is not None:
+            self.video_sink.setVideoFrame(QVideoFrame(image) if not image.isNull() else QVideoFrame())
         self.update()
 
     def set_regions(self, regions):
@@ -158,14 +247,19 @@ class VideoCanvas(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#10141b"))
+        if self.video_widget is None:
+            self.paint_canvas(QPainter(self), video=True)
+
+    def paint_canvas(self, painter, *, video):
+        if video:
+            painter.fillRect(self.rect(), QColor("#10141b"))
         rect = self.video_rect()
         if rect.isEmpty():
             painter.setPen(QColor("#adb7c5"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, tr('영상을 선택하세요'))
             return
-        painter.drawImage(rect, self.image)
+        if video:
+            painter.drawImage(rect, self.image)
         if not self.show_regions:
             return
         def draw_label(point, text):
@@ -251,8 +345,8 @@ class VideoCanvas(QWidget):
         self._end = self.normalized_point(event.position())
         box = self._drag_box()
         self._start = self._end = None
-        if ((box[2] - box[0]) * self.image.width() >= 2
-                and (box[3] - box[1]) * self.image.height() >= 2):
+        if ((box[2] - box[0]) * self.image_size.width() >= 2
+                and (box[3] - box[1]) * self.image_size.height() >= 2):
             self.regions[self.kind] = box
             self.regionChanged.emit(self.kind, box[:])
         self.update()
@@ -270,10 +364,19 @@ class Preview(QWidget):
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(.7)
         self.canvas = VideoCanvas(self)
+        self.canvas.enable_video()
         self.frame_time = None
         self._generation = 0
         self._exact_frame = False
+        self.fallback_duration = 0
+        self._priming = False
         self.sink = None
+        self._frame_slot = None
+        self._pending_seek = None
+        self.seek_timer = QTimer(self)
+        self.seek_timer.setSingleShot(True)
+        self.seek_timer.setInterval(40)
+        self.seek_timer.timeout.connect(self.flush_seek)
         self.play_button = QPushButton(tr('재생'))
         self.play_button.setFixedWidth(90)
         self.play_button.clicked.connect(self.toggle_playback)
@@ -335,21 +438,33 @@ class Preview(QWidget):
         self.canvas.update()
 
     def release(self):
-        """Let go of the application-wide filter its canvas installed."""
+        """Detach native playback before Qt destroys its rendering surface."""
+        self.clear()
         self.canvas.release()
+
+    def closeEvent(self, event):
+        self.release()
+        super().closeEvent(event)
 
     def clear(self):
         self._generation += 1
+        self.seek_timer.stop()
+        self._pending_seek = None
         # Stop before detaching: FFmpeg renderer destruction can otherwise wait for
         # the Python GIL while stop() waits for that renderer (Windows/PySide6).
         self.player.stop()
         self.player.setVideoSink(None)
         self.player.setSource(QUrl())
         if self.sink is not None:
-            self.sink.deleteLater()
+            if self._frame_slot is not None:
+                self.sink.videoFrameChanged.disconnect(self._frame_slot)
+            if self.sink is not self.canvas.video_sink:
+                self.sink.deleteLater()
             self.sink = None
+            self._frame_slot = None
         self.frame_time = None
         self._exact_frame = False
+        self.fallback_duration = 0
         self.canvas._start = self.canvas._end = None
         self.canvas.reset_view()
         self.canvas.set_image(QImage())
@@ -357,26 +472,72 @@ class Preview(QWidget):
         self._duration_changed(0)
         self.frameChanged.emit()
 
-    def load(self, path: Path):
+    def effective_duration(self) -> int:
+        duration = self.player.duration()
+        return duration if duration > 0 else self.fallback_duration
+
+    def load(self, path: Path, duration: float = 0):
         self.clear()
+        if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+            self.fallback_duration = round(duration * 1000)
         generation = self._generation
-        self.sink = QVideoSink(self)
-        self.sink.videoFrameChanged.connect(lambda frame: self._receive_frame(frame, generation))
-        self.player.setSource(QUrl.fromLocalFile(os.path.abspath(os.path.expanduser(path))))
+        self.sink = self.canvas.video_sink or QVideoSink(self)
+        self._frame_slot = lambda frame: self._receive_frame(frame, generation)
+        self.sink.videoFrameChanged.connect(self._frame_slot)
+        resolved = Path(os.path.abspath(os.path.expanduser(path)))
+        self.player.setSource(QUrl.fromLocalFile(str(resolved)))
         self.player.setVideoSink(self.sink)
         self.player.pause()
+        self._prime_initial_media(resolved)
+
+    def _prime_initial_media(self, path: Path):
+        if not path.is_file():
+            if self.fallback_duration > 0 and self.player.duration() <= 0:
+                self._duration_changed(self.fallback_duration)
+            return
+        if self.fallback_duration <= 0:
+            meta_file = path.parent / "source.json"
+            if meta_file.is_file():
+                try:
+                    import json
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    local_dur = meta.get("local_duration")
+                    if isinstance(local_dur, (int, float)) and math.isfinite(local_dur) and local_dur > 0:
+                        self.fallback_duration = round(local_dur * 1000)
+                except (OSError, ValueError):
+                    pass
+        try:
+            import av
+            from PIL.ImageQt import ImageQt
+            from media import oriented_image
+            from video_sampling import video_duration
+            with av.open(str(path)) as container:
+                if self.fallback_duration <= 0:
+                    dur = video_duration(container)
+                    if dur is not None and math.isfinite(dur) and dur > 0:
+                        self.fallback_duration = round(dur * 1000)
+                if self.canvas.image_size.isEmpty() and container.streams.video:
+                    stream = container.streams.video[0]
+                    for frame in container.decode(stream):
+                        qimg = QImage(ImageQt(oriented_image(frame))).copy()
+                        if not qimg.isNull():
+                            self._priming = True
+                            try:
+                                self.canvas.set_image(qimg)
+                            finally:
+                                self._priming = False
+                            self.frame_time = 0.0
+                            self.frameChanged.emit()
+                        break
+        except Exception:
+            pass
+        if self.fallback_duration > 0 and self.player.duration() <= 0:
+            self._duration_changed(self.fallback_duration)
 
     def _receive_frame(self, frame, generation):
-        if generation != self._generation or self._exact_frame or not frame.isValid():
+        if self._priming or generation != self._generation or self._exact_frame or not frame.isValid():
             return
-        image = frame.toImage()
-        if image.isNull():
-            return
-        # toImage applies surface transforms; presentation transforms are separate.
-        image = image.transformed(QTransform().rotate(frame.rotation().value))
-        if frame.mirrored():
-            image = image.mirrored(True, False)
-        self.canvas.set_image(image)
+        self.canvas.set_frame(frame)
         self.frame_time = frame.startTime() / 1_000_000 if frame.startTime() >= 0 else None
         self.frameChanged.emit()
 
@@ -390,13 +551,31 @@ class Preview(QWidget):
     def _seek_slider(self, action):
         seconds = self.slider.sliderPosition() / 1000
         self.seekStarted.emit()
-        self.seek(seconds)
+        self.request_seek(seconds)
+
+    def request_seek(self, seconds):
+        """Coalesce scrubbing input, retaining only the latest requested target."""
+        if not math.isfinite(seconds):
+            return
+        if self.seek_timer.isActive():
+            self._pending_seek = seconds
+        else:
+            self.seek(seconds)
+            self.seek_timer.start()
+
+    def flush_seek(self):
+        if self._pending_seek is not None:
+            self.seek(self._pending_seek)
 
     def seek(self, seconds):
         if not math.isfinite(seconds):
             return
+        self.seek_timer.stop()
+        self._pending_seek = None
         self._exact_frame = False
-        self.player.setPosition(max(0, min(self.player.duration(), round(seconds * 1000))))
+        duration = self.effective_duration()
+        target = max(0, round(seconds * 1000))
+        self.player.setPosition(min(duration, target) if duration > 0 else target)
 
     def toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -411,7 +590,8 @@ class Preview(QWidget):
         self.play_button.setText(tr('일시정지') if state == QMediaPlayer.PlaybackState.PlayingState else tr('재생'))
 
     def _duration_changed(self, milliseconds):
-        self.slider.setRange(0, min(milliseconds, 2_147_483_647))
+        effective = milliseconds if milliseconds > 0 else self.fallback_duration
+        self.slider.setRange(0, min(effective, 2_147_483_647))
         self._position_changed(self.player.position())
 
     def _position_changed(self, milliseconds):
@@ -420,4 +600,4 @@ class Preview(QWidget):
         def clock(ms):
             seconds = ms // 1000
             return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
-        self.time_label.setText(f"{clock(milliseconds)} / {clock(self.player.duration())}")
+        self.time_label.setText(f"{clock(milliseconds)} / {clock(self.effective_duration())}")

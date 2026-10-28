@@ -31,8 +31,13 @@ def same_player(value, other):
     return left == right or SequenceMatcher(None, left, right).ratio() >= .6
 
 
-def make_ocr(directory, cancel, report):
+def make_ocr(directory, cancel, report, *, _local=False):
     """Use pinned RapidOCR recognition only: the user already supplies text-line ROIs."""
+    if not _local:
+        from ocr_bridge import bundled_worker, RemoteOCR
+        worker = bundled_worker()
+        if worker is not None:
+            return RemoteOCR(worker, directory, cancel, report)
     import rapidocr
     from rapidocr import LangRec, ModelType, OCRVersion
     from rapidocr.ch_ppocr_rec import TextRecInput, TextRecognizer

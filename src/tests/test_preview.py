@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -157,6 +158,71 @@ class PreviewTest(unittest.TestCase):
         self.assertTrue(preview.player.source().isEmpty())
         preview.close()
 
+    def test_frame_metadata_and_coordinates_do_not_extract_pixels(self):
+        canvas = VideoCanvas()
+        canvas.resize(400, 400)
+        frame = QVideoFrame(QImage(400, 200, QImage.Format.Format_RGB32))
+        frame.setRotation(QtVideo.Rotation.Clockwise90)
+        for _ in range(20):
+            canvas.set_frame(frame)
+            canvas.video_rect()
+            canvas.zoom(1.01, QPointF(200, 200))
+        self.assertEqual(canvas.image_size.width(), 200)
+        self.assertEqual(canvas.snapshot_count, 0)
+        self.assertEqual(canvas.image.width(), 200)
+        self.assertEqual(canvas.image.width(), 200)
+        self.assertEqual(canvas.snapshot_count, 1)
+        canvas.set_frame(frame)
+        self.assertEqual(canvas.image.width(), 200)
+        self.assertEqual(canvas.snapshot_count, 2)
+        canvas.close()
+
+    def test_scrubbing_coalesces_and_direct_seek_cancels_pending_target(self):
+        preview = Preview()
+        with patch.object(preview.player, 'duration', return_value=100000), patch.object(preview.player, 'setPosition') as move:
+            for seconds in range(1, 20):
+                preview.request_seek(seconds)
+            self.assertEqual(move.call_count, 1)
+            preview.flush_seek()
+            self.assertEqual(move.call_count, 2)
+            move.assert_called_with(19000)
+            preview.request_seek(20)
+            preview.request_seek(21)
+            preview.seek(30)
+            preview.flush_seek()
+            move.assert_called_with(30000)
+        preview.clear()
+        preview.close()
+
+    def test_hidden_profile_never_extracts_crop_pixels(self):
+        from profile_panel import ProfilePanel
+        preview = Preview()
+        panel = ProfilePanel(preview)
+        panel.name.setText('snapshot test')
+        panel.kind.setCurrentIndex(panel.kind.findData('jacket'))
+        preview.set_regions({'jacket': [.1, .1, .9, .9]})
+        frame = QVideoFrame(QImage(400, 200, QImage.Format.Format_RGB32))
+        preview._receive_frame(frame, 0)
+        panel.update_crop()
+        panel.current_profile()
+        self.assertEqual(preview.canvas.snapshot_count, 0)
+        panel.show()
+        self.app.processEvents()
+        panel.guide_player.stop()
+        self.assertEqual(preview.canvas.snapshot_count, 1)
+        with patch.object(preview.player, 'isPlaying', return_value=True):
+            for _ in range(20):
+                preview._receive_frame(frame, 0)
+            self.assertEqual(preview.canvas.snapshot_count, 1)
+            panel.update_crop()
+            self.assertEqual(preview.canvas.snapshot_count, 2)
+        panel.hide()
+        preview._receive_frame(frame, 0)
+        self.assertEqual(preview.canvas.snapshot_count, 2)
+        panel.guide_video.release()
+        panel.close()
+        preview.close()
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required")
     def test_switch_while_playing_audio_video_does_not_deadlock(self):
         # Use a subprocess: a GIL/native renderer deadlock also blocks Qt timers.
@@ -193,6 +259,7 @@ timer.start(20)
 preview.load(sys.argv[1])
 app.exec()
 """
+        script = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n" + script
         with tempfile.TemporaryDirectory() as directory:
             a, b = Path(directory) / "a.mp4", Path(directory) / "b.mp4"
             subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",

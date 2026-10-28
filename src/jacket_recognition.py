@@ -1,7 +1,7 @@
 """Default song recognizer: pHash catalog, jacket calibration and boundary refinement."""
 from i18n import tr
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
+from concurrent.futures import CancelledError, ProcessPoolExecutor, TimeoutError
 from bisect import bisect_right
 import logging
 import math
@@ -62,18 +62,19 @@ def load_catalog(directory, cancel, report):
     return entries
 
 
-def identify(image, catalog, options, previous=None, cancel=None, *, search=True, local_only=False):
+def identify(image, catalog, options, previous=None, cancel=None, *, search=True, local_only=False,
+             match_cache=None):
     """Search square subwindows, then verify/track the prior location as in maipage."""
     if not catalog:
         raise ValueError(tr('사용 가능한 자켓이 없습니다.'))
-    hashes = np.array([row["hash"] for row in catalog], dtype=np.uint64)
+    hashes = None
     width, height = image.size
     shortest = min(width, height)
     best = None
     seen = set()
 
     def evaluate(rect):
-        nonlocal best
+        nonlocal best, hashes
         if rect in seen:
             return None
         seen.add(rect)
@@ -82,7 +83,18 @@ def identify(image, catalog, options, previous=None, cancel=None, *, search=True
         x0, y0, x1, y1 = rect
         if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
             return None
-        distances = np.bitwise_count(hashes ^ np.uint64(phash(image.crop(rect))))
+        fingerprint = phash(image.crop(rect))
+        # Scan-local, single-entry cache. Exact pHash equality gives exactly the
+        # same catalog distances; approximate equality could hide a song change.
+        # Keep the current rectangle and never cache an unrecognized observation.
+        if match_cache is not None and match_cache.get("hash") == fingerprint:
+            result = {**match_cache["result"], "sub_rect": list(rect)}
+            if best is None or (result["distance"], -result["margin"]) < (best["distance"], -best["margin"]):
+                best = result
+            return result
+        if hashes is None:
+            hashes = np.array([row["hash"] for row in catalog], dtype=np.uint64)
+        distances = np.bitwise_count(hashes ^ np.uint64(fingerprint))
         ranked = np.argsort(distances, kind="stable")[:2]
         index = int(ranked[0])
         distance = int(distances[index])
@@ -92,6 +104,10 @@ def identify(image, catalog, options, previous=None, cancel=None, *, search=True
                   "song_id": catalog[index]["image_url"] if found else None,
                   "title": catalog[index]["title"] if found else "", "distance": distance,
                   "margin": margin, "sub_rect": list(rect)}
+        if match_cache is not None:
+            match_cache.clear()
+            if found:
+                match_cache.update(hash=fingerprint, result=dict(result))
         if best is None or (distance, -margin) < (best["distance"], -best["margin"]):
             best = result
         return result
@@ -99,7 +115,7 @@ def identify(image, catalog, options, previous=None, cancel=None, *, search=True
     if not search:
         return evaluate((0, 0, width, height))
 
-    # Always compare against the whole catalog so a changed song cannot remain locked.
+    # Changed hashes still use the whole catalog so a changed song cannot remain locked.
     if previous and previous.get("sub_rect"):
         old = tuple(previous["sub_rect"])
         result = evaluate(old)
@@ -149,24 +165,30 @@ def _candidates(observations, start, end, stable):
 
 
 def _init_analysis_worker(catalog, options, stop):
-    global _worker_catalog, _worker_options, _worker_stop
+    global _worker_catalog, _worker_options, _worker_stop, _worker_match_cache
     _worker_catalog, _worker_options, _worker_stop = catalog, options, stop
+    _worker_match_cache = {}
 
 
-def _identify_batch(batch, catalog, options, stop):
+def _identify_batch(batch, catalog, options, stop, match_cache=None):
+    # The caller retains this across batches; each process owns its own cache.
+    if match_cache is None:
+        match_cache = {}
     previous, results = None, []
     for sample in batch:
         seconds, image = sample[:2]
         check_cancel(stop)
-        previous = (identify(image, catalog, options, {"sub_rect": sample[2]}, stop, local_only=True)
-                    if len(sample) == 3 else identify(image, catalog, options, cancel=stop, search=False))
+        previous = (identify(image, catalog, options, {"sub_rect": sample[2]}, stop, local_only=True,
+                             match_cache=match_cache)
+                    if len(sample) == 3 else identify(image, catalog, options, cancel=stop, search=False,
+                                                     match_cache=match_cache))
         results.append((seconds, previous))
     return results
 
 
 def _worker_batch(batch):
     began = perf_counter()
-    result = _identify_batch(batch, _worker_catalog, _worker_options, _worker_stop)
+    result = _identify_batch(batch, _worker_catalog, _worker_options, _worker_stop, _worker_match_cache)
     return os.getpid(), result, perf_counter() - began
 
 
@@ -178,6 +200,7 @@ def scan_jackets(frames, catalog, options, cancel, workers, report, *, total=Non
     metrics["result_wait_s"] = 0.
     scan_started, last_log = perf_counter(), float("-inf")
     pending = deque()
+    match_cache = {}
     def log_queue(done, force=False):
         nonlocal last_log
         now = perf_counter()
@@ -198,7 +221,7 @@ def scan_jackets(frames, catalog, options, cancel, workers, report, *, total=Non
         log_queue(done, total is not None and done >= total)
     def match(batch):
         began = perf_counter()
-        result = _identify_batch(batch, catalog, options, cancel)
+        result = _identify_batch(batch, catalog, options, cancel, match_cache)
         metrics["match_s"] += perf_counter() - began
         if on_observation is not None:
             for seconds, observation in result:
@@ -216,6 +239,7 @@ def scan_jackets(frames, catalog, options, cancel, workers, report, *, total=Non
         assert workers == 1
         batch_size = 1
     first = [head, *islice(frames, batch_size - 1)]
+    head = None
     reason = tr(' · 이미지 메모리 상한 적용') if workers < min(requested, 61) else ""
     update(0, tr(
         '곡 판독 · 요청 {requested} / 최대 {workers}작업자 · 묶음 {batch_size}장{reason}',
@@ -227,9 +251,11 @@ def scan_jackets(frames, catalog, options, cancel, workers, report, *, total=Non
     batches = iter(lambda: list(islice(frames, batch_size)), [])
     if workers == 1:
         results = match(first)
+        first.clear()
         update(len(results), tr('곡 판독 · 판독 작업자 1개'))
         for batch in batches:
             results.extend(match(batch))
+            batch.clear()
             if on_observation is None or len(results) % 16 == 0:
                 update(len(results), tr('곡 판독 · 판독 작업자 1개'))
         log_queue(len(results), True)
@@ -241,6 +267,7 @@ def scan_jackets(frames, catalog, options, cancel, workers, report, *, total=Non
     pending, results, observed_pids = deque(), [], set()
     try:
         pending.append(pool.submit(_worker_batch, first))
+        first = None
         exhausted = False
         while pending:
             check_cancel(cancel)
@@ -322,7 +349,8 @@ def location_at(anchors, seconds):
     return anchors[index][1]
 
 
-def detect(path, start, end, profile, directory, cancel, report, *, workers=0, decoder_threads=0, gpu=False):
+def detect(path, start, end, profile, directory, cancel, report, *, workers=0, decoder_threads=0, gpu=False,
+           gpu_convert=None, pipelined=False):
     options = {**DEFAULTS, **profile.get("recognition", {})}
     result = {"warnings": [], "profile": profile}
     progress(report, 1, 0, None, tr('자켓 목록 준비'))
@@ -358,6 +386,38 @@ def detect(path, start, end, profile, directory, cancel, report, *, workers=0, d
     # ponytail: synchronous CPU only; asynchronous workers need per-batch frame ownership.
     buffer = (BoundaryBuffer(start, options["sample_seconds"], profile["regions"]["jacket"],
                              profile["size"], cancel) if count == 1 and not gpu else None)
+    # Keep the existing synchronous boundary observer/match ownership unchanged.
+    pipelined = pipelined and buffer is None
+    metrics['pipelined'] = pipelined
+    freeplay = None
+    if options.get("freeplay_resets"):
+        if "achievement" not in profile["regions"]:
+            result["warnings"].append(tr('Free Play 보정에는 플레이 중 1P 달성률 영역이 필요합니다.'))
+        else:
+            from freeplay import FreePlayObserver
+            from text_recognition import make_ocr
+            try:
+                freeplay = FreePlayObserver(make_ocr(directory, cancel, report),
+                    profile["regions"]["achievement"], profile["size"], start,
+                    options["sample_seconds"], cancel, gpu_convert=gpu if gpu_convert is None else gpu_convert)
+            except CancelledError:
+                raise
+            except Exception as error:
+                result["warnings"].append(tr('Free Play 보정 준비 실패: {error}', error=error))
+
+    def observe_frame(seconds, frame):
+        nonlocal freeplay
+        if buffer:
+            buffer.observe(seconds, frame)
+        if freeplay:
+            try:
+                freeplay.observe(seconds, frame)
+            except CancelledError:
+                raise
+            except Exception as error:
+                freeplay.close()
+                freeplay = None
+                result["warnings"].append(tr('Free Play 보정 실패: {error}', error=error))
     def rectangle(region, seconds):
         if anchors:
             return location_at(anchors, seconds)
@@ -367,17 +427,30 @@ def detect(path, start, end, profile, directory, cancel, report, *, workers=0, d
     def frames():
         for seconds, image in analysis_samples(path, start, end, options["sample_seconds"], cancel,
                                                 threads, metrics, gpu, report, result["warnings"],
+                                                gpu_convert=gpu_convert, pipelined=pipelined,
                                                 region=profile["regions"]["jacket"], reference_size=profile["size"],
-                                                on_frame=buffer.observe if buffer else None):
+                                                on_frame=observe_frame if buffer or freeplay else None):
             yield seconds, image, rectangle(image, seconds)
-    observations = scan_jackets(frames(), catalog, options, cancel, count, report,
-                                total=math.ceil((end - start) / options["sample_seconds"]), metrics=metrics,
-                                on_observation=buffer.matched if buffer else None)
+    source = frames()
+    if pipelined:
+        from pipeline import prefetch
+        source = prefetch(source, cancel, capacity=2)
+    try:
+        observations = scan_jackets(source, catalog, options, cancel, count, report,
+                                    total=math.ceil((end - start) / options["sample_seconds"]), metrics=metrics,
+                                    on_observation=buffer.matched if buffer else None)
+    finally:
+        source.close()
+        if freeplay:
+            freeplay.close()
+        if buffer:
+            buffer.finish_scan()
     if buffer:
         buffer.finish_scan()
         result["boundary_buffer"] = buffer.metrics
     progress(report, 3, len(observations), len(observations), tr('곡 판독 완료'), metrics=dict(metrics))
     candidates = _candidates(observations, start, end, options["stable_seconds"])
+    del observations
     progress(report, 4, 0, max(1, len(candidates) - 1), tr('곡 경계 정밀 확인'))
     # Refine only short windows around observed changes; do not repeatedly seek the full scan.
     for index in range(1, len(candidates)):
@@ -395,6 +468,8 @@ def detect(path, start, end, profile, directory, cancel, report, *, workers=0, d
                 break
         progress(report, 4, index, max(1, len(candidates) - 1), tr('곡 경계 정밀 확인'))
     progress(report, 4, 1, 1, tr('곡 경계 확인 완료'))
+    if freeplay:
+        candidates = freeplay.split(candidates)
     return {**result, "candidates": candidates}
 
 

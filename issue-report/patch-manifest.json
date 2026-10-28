@@ -1,0 +1,23 @@
+{
+  "base_commit": "9110b4d71cda511ac6ee3ed5b165349988de0bdb",
+  "files": [
+    "src/jacket_recognition.py",
+    "src/profiles.py",
+    "src/profile_panel.py",
+    "src/tests/test_recognition.py",
+    "src/locales/en/LC_MESSAGES/arcadeclip.po",
+    "src/locales/en/LC_MESSAGES/arcadeclip.mo",
+    "src/freeplay.py",
+    "src/tests/test_freeplay.py",
+    "run/benchmark_match_reuse.py"
+  ],
+  "patch_sha256": "0cef5c4d6a723f467e5a5a2b833da9063ae324af9ef27ce417446bec1b3ce322",
+  "clean_base_apply_check": "passed",
+  "excluded": [
+    "ARM64 build files",
+    "src/text_recognition.py",
+    "src/ocr_bridge.py",
+    "src/ocr_worker.py",
+    "src/tests/test_ocr_bridge.py"
+  ]
+}

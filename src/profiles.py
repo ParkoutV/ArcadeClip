@@ -43,7 +43,9 @@ def validate_profile(value):
         options = value["recognition"]
         limits = {"sample_seconds": (.1, 5), "stable_seconds": (.1, 10),
                   "hash_distance": (0, 64), "hash_margin": (0, 64), "ocr_tail_seconds": (.1, 10), "location_seconds": (1, 120)}
-        if not isinstance(options, dict) or set(options) - (set(limits) | {"ocr_language"}):
+        if not isinstance(options, dict) or set(options) - (set(limits) | {"ocr_language", "freeplay_resets"}):
+            raise ValueError(tr('인식 설정 형식을 확인해 주세요.'))
+        if "freeplay_resets" in options and type(options["freeplay_resets"]) is not bool:
             raise ValueError(tr('인식 설정 형식을 확인해 주세요.'))
         for key, (low, high) in limits.items():
             if key in options and (type(options[key]) not in (int, float)
