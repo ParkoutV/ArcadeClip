@@ -67,7 +67,7 @@
         [
           1,
           15,
-          19,
+          15,
           5
         ],
         [
@@ -81,9 +81,9 @@
       ],
       [
         [
-          20,
+          16,
           15,
-          19,
+          15,
           5
         ],
         [
@@ -113,9 +113,9 @@
       ],
       [
         [
-          77,
+          70,
           91,
-          22,
+          29,
           5
         ],
         [
@@ -129,10 +129,10 @@
       ]
     ],
     [
-      "YouTube에서 가져오려면",
-      "To import from YouTube",
-      "오른쪽 {{YouTube 링크}}에 주소를 붙여넣고 {{영상 정보 확인 →}}를 누르세요. 영상 정보를 확인하면 다운로드 화면이 열립니다.",
-      "Paste the address into {{YouTube 링크}} on the right, then click {{영상 정보 확인 →}}. The download screen opens after the video details load."
+      "YouTube·OBS 스트림에서 가져오려면",
+      "To import from YouTube or OBS streams",
+      "오른쪽 {{YouTube 링크}}에 주소를 붙여넣고 {{영상 정보 확인 →}}를 누르세요. 영상 정보를 확인하면 다운로드 화면이 열립니다.\n\n실시간 방송을 바로 받아 저장하려면 {{OBS 스트림 자동 클립}}을 사용하세요. {{선택지 A · 직접 수신 (RTMP/SRT)}}는 OBS에서 보낸 스트림을 직접 받아 연속 저장합니다. 외부망 연결 방법은 {{포트포워딩 · 고정 DDNS 가이드}}에서 확인하세요. {{선택지 B · YouTube 라이브 자동 감지}}는 진행 중인 YouTube 라이브나 채널 주소를 감시해 최신 지점부터 실시간 녹화합니다.\n\n{{스트림 자동 수신 시작}} 또는 {{개별 라이브 녹화 시작}}으로 녹화를 시작하세요. 방송이 끝나거나 {{수신 정지 · 시간 선택으로}}를 누르면 녹화한 영상이 열립니다. 미리 저장해 둔 프로필로 클립까지 바로 만들려면 {{수신 후 자동으로 곡 분석 및 클립 저장}}에 체크하세요.",
+      "Paste the address into {{YouTube 링크}} on the right, then click {{영상 정보 확인 →}}. The download screen opens after the video details load.\n\nUse {{OBS 스트림 자동 클립}} to capture a live broadcast directly. {{선택지 A · 직접 수신 (RTMP/SRT)}} records an incoming RTMP or SRT stream from OBS. Click {{포트포워딩 · 고정 DDNS 가이드}} for external network setup. {{선택지 B · YouTube 라이브 자동 감지}} watches a YouTube live URL or channel and records from the live edge.\n\nStart recording with {{스트림 자동 수신 시작}} or {{개별 라이브 녹화 시작}}. When the broadcast ends or you click {{수신 정지 · 시간 선택으로}}, the recorded video opens. Check {{수신 후 자동으로 곡 분석 및 클립 저장}} to analyze and export clips automatically using your saved profile."
     ]
   ],
   [
@@ -236,7 +236,7 @@
           77,
           20,
           22,
-          5
+          4
         ],
         [
           "프로필 고르기",
@@ -250,9 +250,9 @@
       [
         [
           77,
-          28,
+          27,
           22,
-          5
+          4
         ],
         [
           "영역 종류 고르기",
@@ -282,9 +282,9 @@
       [
         [
           77,
-          87,
+          88,
           22,
-          5
+          4
         ],
         [
           "현재 장면으로 확인",
@@ -307,8 +307,8 @@
           "Find songs"
         ],
         [
-          "{{이 구간에서 곡 찾기 →}}를 누르세요. 긴 영상은 곡 찾기에 시간이 오래 걸릴 수 있습니다. 하단 진행 상태를 확인하세요.",
-          "Click {{이 구간에서 곡 찾기 →}}. Finding songs in a long video can take a while. Check progress at the bottom."
+          "{{이 구간에서 곡 찾기 →}}를 누르세요. 긴 영상은 곡 찾기에 시간이 오래 걸릴 수 있습니다. 하단 진행 상태를 확인하세요.\n\n위 체크박스에서 {{GPU 영상 디코딩}}, {{GPU 이미지 변환}}, {{디코딩·변환·판독 겹쳐 처리}}를 선택할 수 있습니다. GPU 기능을 지원하지 않는 장치에서는 자동으로 CPU 처리로 전환됩니다.",
+          "Click {{이 구간에서 곡 찾기 →}}. Finding songs in a long video can take a while. Check progress at the bottom.\n\nUse the checkboxes above to toggle {{GPU 영상 디코딩}}, {{GPU 이미지 변환}}, and {{디코딩·변환·판독 겹쳐 처리}}. Unsupported devices automatically fall back to CPU processing."
         ]
       ]
     ],
@@ -1079,34 +1079,34 @@
       ],
       [
         [
-          4,
-          46,
-          92,
-          5
+          3,
+          42,
+          94,
+          13
         ],
         [
           "곡 끝의 글자 확인",
           "Check text at song end"
         ],
         [
-          "이름·달성률을 읽는 시간을 늘리려면 {{곡 끝 글자 확인 범위 (초)}}를 늘리세요. 글자 영역이 실제 글자를 감싸는지도 확인하세요.",
-          "Increase {{곡 끝 글자 확인 범위 (초)}} to read text over a longer interval near the song’s end. Check that the text regions frame the actual text."
+          "이름·달성률을 읽는 시간을 늘리려면 {{곡 끝 글자 확인 범위 (초)}}를 늘리세요. 글자 영역이 실제 글자를 감싸는지도 확인하세요.\n\nFree Play 모드에서 같은 곡을 연속 플레이하거나 재시작한 구간을 나누려면 {{Free Play: 달성률 초기화로 같은 곡 재시작 구분}}을 켜세요. 플레이 중 1P 달성률이 0%·101%로 초기화되는 지점을 확인해 클립을 구분합니다.",
+          "Increase {{곡 끝 글자 확인 범위 (초)}} to read text over a longer interval near the song’s end. Check that the text regions frame the actual text.\n\nTo split repeated or restarted songs in Free Play mode, enable {{Free Play: 달성률 초기화로 같은 곡 재시작 구분}}. The app checks where the in-play 1P achievement resets to 0% or 101%."
         ]
       ],
       [
         [
           3,
-          54,
+          56,
           94,
-          20
+          21
         ],
         [
           "분석 성능 조절",
           "Adjust analysis performance"
         ],
         [
-          "처음에는 자동값을 사용하세요. 작업 수를 높이면 CPU·메모리 사용이 늘 수 있습니다. 변경한 값은 다음 분석부터 적용됩니다.",
-          "Start with the automatic values. More workers can use more CPU and memory. Changes take effect on the next analysis."
+          "처음에는 자동값을 사용하세요. 작업 수를 높이면 CPU·메모리 사용이 늘 수 있습니다. 변경한 값은 다음 분석부터 적용됩니다. GPU 디코딩·변환과 겹쳐 처리 옵션은 3번 인식 영역 화면에서 설정합니다.",
+          "Start with the automatic values. More workers can use more CPU and memory. Changes take effect on the next analysis. Configure GPU decoding, GPU conversion, and overlapped processing on step 3 (Recognition regions)."
         ]
       ]
     ],
@@ -1194,18 +1194,18 @@
     [
       [
         [
-          4,
-          10,
-          92,
-          8
+          3,
+          7,
+          94,
+          12
         ],
         [
           "새 버전 확인",
           "Check for a new version"
         ],
         [
-          "{{새 버전 확인}}을 누르세요. 새 버전이 있으면 다운로드 페이지를 열 수 있습니다.",
-          "Click {{새 버전 확인}}. If a new version is available, you can open its download page."
+          "{{새 버전 확인}}을 누르세요. 새 버전이 있으면 {{자동 다운로드 및 업데이트 설치}}로 바로 업데이트하거나 {{릴리스 페이지 열기}}로 다운로드 페이지를 열 수 있습니다.\n\n내려받은 설치 파일(.exe)이나 업데이트 압축 파일(.zip)이 있다면 {{설치 파일(.exe/.zip)로 업데이트…}}를 눌러 적용하세요. 사용자 데이터·프로필·클립은 그대로 유지됩니다.",
+          "Click {{새 버전 확인}}. When a new version is available, choose {{자동 다운로드 및 업데이트 설치}} to update in place or {{릴리스 페이지 열기}} to open the download page.\n\nTo apply a downloaded installer (.exe) or update archive (.zip) directly, click {{설치 파일(.exe/.zip)로 업데이트…}}. Your data, profiles, and clips are preserved."
         ]
       ],
       [

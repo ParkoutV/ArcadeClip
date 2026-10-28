@@ -2905,7 +2905,7 @@ msgid "새 스트림 키를 발급했습니다."
 msgstr "Generated a new stream key."
 
 msgid "포트포워딩 · 고정 DDNS 가이드"
-msgstr "Port forwarding & static DDNS guide"
+msgstr "Port forwarding · Static DDNS guide"
 
 msgid "안내문 복사"
 msgstr "Copy guide"
@@ -3089,13 +3089,13 @@ msgid "시작~정지 누른 구간만 부분 녹화 (개별 라이브용)"
 msgstr "Record only the Start-to-Stop interval (for individual live streams)"
 
 msgid "수신 정지 · 클립 생성"
-msgstr "Stop ingest & create clips"
+msgstr "Stop ingest · Create clips"
 
 msgid "클립보드에 유효한 YouTube 라이브 또는 채널 주소가 없습니다."
 msgstr "No valid YouTube live or channel URL found in the clipboard."
 
 msgid "개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작]과 [수신 정지 · 클립 생성]으로 원하는 구간을 녹화할 수 있습니다."
-msgstr "Pasted individual YouTube live link. Use [Start individual live recording] and [Stop ingest & create clips] to record your desired section."
+msgstr "Pasted individual YouTube live link. Use [Start individual live recording] and [Stop ingest · Create clips] to record your desired section."
 
 msgid "YouTube 채널 라이브 주소를 붙여넣었습니다."
 msgstr "Pasted YouTube channel live URL."
@@ -3252,7 +3252,7 @@ msgid "미리 저장해 둔 인식 영역 프로필이 있을 때만 체크하�
 msgstr "Check only when you already have a saved recognition profile. Leave unchecked to configure [2] Time selection and [3] Recognition regions after saving the stream."
 
 msgid "수신 정지 · 시간 선택으로"
-msgstr "Stop ingest & select time"
+msgstr "Stop ingest · Select time"
 
 msgid "개별 YouTube 라이브 링크를 붙여넣었습니다. [개별 라이브 녹화 시작] 후 원하는 시점에 정지하면 시간 선택 및 인식 영역을 설정할 수 있습니다."
 msgstr "Pasted individual YouTube live link. Start with [Start individual live recording] and stop at any point to configure time selection and recognition regions."

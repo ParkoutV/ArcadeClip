@@ -34,6 +34,7 @@ class ProfilePanel(QWidget):
         self.persist_calibration = True
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         layout.addWidget(QLabel(tr('오락실 프로필')))
         profile_row = QHBoxLayout()
         self.profile_picker = QComboBox()
@@ -80,7 +81,7 @@ class ProfilePanel(QWidget):
         self.guide_video = VideoCanvas()
         self.guide_video.enable_video()
         self.guide_video.setEnabled(False)
-        self.guide_video.setMinimumSize(240, 135)
+        self.guide_video.setMinimumSize(220, 118)
         self.guide_video.setMaximumHeight(200)
         layout.addWidget(self.guide_video)
         self.guide_pause = QPushButton(tr('예시 일시정지'))
@@ -99,7 +100,7 @@ class ProfilePanel(QWidget):
         layout.addWidget(QLabel(tr('현재 지정 영역')))
         self.crop = QLabel()
         self.crop.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.crop.setMinimumHeight(90)
+        self.crop.setMinimumHeight(74)
         self.crop.setAccessibleName(tr('선택한 인식 영역 확대'))
         layout.addWidget(self.crop)
         for actions in (((tr('영역 지우기'), self.clear_region), (tr('좌표 입력'), self.edit_coordinates)),
@@ -222,7 +223,7 @@ class ProfilePanel(QWidget):
         x0, y0, x1, y1 = box
         cropped = image.copy(round(x0 * size[0]), round(y0 * size[1]),
                              round((x1 - x0) * size[0]), round((y1 - y0) * size[1]))
-        self.crop.setPixmap(QPixmap.fromImage(cropped).scaled(220, 100, Qt.AspectRatioMode.KeepAspectRatio))
+        self.crop.setPixmap(QPixmap.fromImage(cropped).scaled(220, 74, Qt.AspectRatioMode.KeepAspectRatio))
 
     def clear_region(self):
         regions = self.preview.regions

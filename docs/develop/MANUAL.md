@@ -69,11 +69,11 @@
 1. **Settings → Pages → Source**에서 **GitHub Actions**를 고르세요.
 2. `main`에 설명서나 번역을 밀면 워크플로가 실행됩니다. Actions 탭의 **Run workflow**로 직접 실행해도 됩니다.
 3. **Settings → Pages → Visit site**에서 주소를 확인하세요.
-4. README의 링크가 확인한 주소를 가리키는지 보세요. 현재 주소는 https://151net.github.io/ArcadeClip/ 입니다.
+4. README의 링크가 확인한 주소를 가리키는지 보세요. 현재 주소는 https://parkoutv.github.io/ArcadeClip/ 입니다.
 
 워크플로는 올리기 전에 `run/check_manual.py`와 Node 검사를 실행합니다. `content.json`이나 번역을 고치고 설명서를 다시 빌드하지 않았다면 여기서 멈춥니다. 두 검사 모두 표준 라이브러리만 쓰므로 의존성을 설치하지 않습니다.
 
-기본 도메인을 쓰면 주소는 `https://151net.github.io/ArcadeClip/`입니다. 폴더 최상단의 `index.html`이 소개 페이지, `manual.html`이 설명서입니다. 설명서는 한국어 `#ko/overview/1`, 영어 `#en/overview/1`을 붙이면 해당 항목이 바로 열립니다.
+기본 도메인을 쓰면 주소는 `https://parkoutv.github.io/ArcadeClip/`입니다. 폴더 최상단의 `index.html`이 소개 페이지, `manual.html`이 설명서입니다. 설명서는 한국어 `#ko/overview/1`, 영어 `#en/overview/1`을 붙이면 해당 항목이 바로 열립니다.
 
 참고: [GitHub Pages 소개](https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages), [공식 워크플로 설정](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
 

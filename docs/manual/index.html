@@ -60,12 +60,12 @@ html[lang="ko"] [data-lang="en"], html[lang="en"] [data-lang="ko"] { display: no
   </div>
 
   <div class="actions">
-    <a class="primary" href="https://github.com/151net/ArcadeClip/releases/latest" data-lang="ko">Windows용 내려받기</a>
-    <a class="primary" href="https://github.com/151net/ArcadeClip/releases/latest" data-lang="en">Download for Windows</a>
+    <a class="primary" href="https://github.com/ParkoutV/ArcadeClip/releases/latest" data-lang="ko">Windows용 내려받기</a>
+    <a class="primary" href="https://github.com/ParkoutV/ArcadeClip/releases/latest" data-lang="en">Download for Windows</a>
     <a href="manual.html#ko/overview/1" data-lang="ko">사용 설명서</a>
     <a href="manual.html#en/overview/1" data-lang="en">User guide</a>
-    <a href="https://github.com/151net/ArcadeClip" data-lang="ko">소스 코드</a>
-    <a href="https://github.com/151net/ArcadeClip" data-lang="en">Source code</a>
+    <a href="https://github.com/ParkoutV/ArcadeClip" data-lang="ko">소스 코드</a>
+    <a href="https://github.com/ParkoutV/ArcadeClip" data-lang="en">Source code</a>
   </div>
 </header>
 
@@ -86,10 +86,10 @@ html[lang="ko"] [data-lang="en"], html[lang="en"] [data-lang="ko"] { display: no
   <h2 data-lang="en">Features</h2>
   <ul class="does">
     <li>
-      <h3 data-lang="ko">곡 찾기</h3>
-      <h3 data-lang="en">Find songs</h3>
-      <p data-lang="ko">화면의 자켓을 공식 자켓과 비교해 곡이 바뀌는 지점을 찾습니다.</p>
-      <p data-lang="en">Compares the jacket on screen with the official song art to find where each song starts and ends.</p>
+      <h3 data-lang="ko">곡 찾기와 GPU 분석</h3>
+      <h3 data-lang="en">Find songs with GPU analysis</h3>
+      <p data-lang="ko">화면의 자켓을 공식 자켓과 비교해 곡이 바뀌는 지점을 찾습니다. GPU 디코딩·이미지 변환·파이프라인 겹쳐 처리와 Free Play 재시작 구분을 지원합니다.</p>
+      <p data-lang="en">Compares the jacket on screen with the official song art to find song boundaries. Supports GPU decoding, GPU ROI conversion, pipelined analysis, and Free Play restart detection.</p>
     </li>
     <li>
       <h3 data-lang="ko">이름과 달성률 읽기</h3>
@@ -98,10 +98,10 @@ html[lang="ko"] [data-lang="en"], html[lang="en"] [data-lang="ko"] { display: no
       <p data-lang="en">Reads the text on screen and builds file names from the song title, player name, and achievement.</p>
     </li>
     <li>
-      <h3 data-lang="ko">YouTube 구간 가져오기</h3>
-      <h3 data-lang="en">Download a YouTube range</h3>
-      <p data-lang="ko">링크를 붙여넣고 미리보기를 보며 슬라이더로 받을 구간을 정합니다. 진행 중인 라이브는 몇 분 전인지 표시합니다.</p>
-      <p data-lang="en">Paste a link, preview a frame, and choose a range with the slider. Live streams show how far back each point is.</p>
+      <h3 data-lang="ko">YouTube·OBS 스트림 가져오기</h3>
+      <h3 data-lang="en">YouTube &amp; OBS stream ingest</h3>
+      <p data-lang="ko">YouTube 링크에서 원하는 구간만 내려받거나, OBS(RTMP/SRT) 및 YouTube 라이브 방송을 실시간 수신해 바로 분석·클립 저장으로 이어갑니다.</p>
+      <p data-lang="en">Download a selected YouTube range, or capture live OBS (RTMP/SRT) and YouTube broadcasts in real time for automatic analysis and clipping.</p>
     </li>
     <li>
       <h3 data-lang="ko">저장 방식 선택</h3>
@@ -252,14 +252,14 @@ html[lang="ko"] [data-lang="en"], html[lang="en"] [data-lang="ko"] { display: no
       <tr>
         <th scope="row" data-lang="ko">운영체제</th>
         <th scope="row" data-lang="en">Operating system</th>
-        <td data-lang="ko">Windows 10 또는 11 x64</td>
-        <td data-lang="en">Windows 10 or 11, x64</td>
+        <td data-lang="ko">Windows 10·11 AMD64 (x64) 또는 Windows 11 ARM64</td>
+        <td data-lang="en">Windows 10/11 AMD64 (x64) or Windows 11 ARM64</td>
       </tr>
       <tr>
         <th scope="row" data-lang="ko">실행</th>
         <th scope="row" data-lang="en">Run</th>
-        <td data-lang="ko">ZIP을 풀고 <b>ArcadeClip.exe</b>를 실행하세요.</td>
-        <td data-lang="en">Unpack the ZIP and run <b>ArcadeClip.exe</b>.</td>
+        <td data-lang="ko">통합 설치 파일(<b>user-setup.exe</b>)로 설치하거나 포터블 폴더의 <b>ArcadeClip.exe</b>를 실행하세요. 앱 안에서도 새 버전 자동 업데이트를 지원합니다.</td>
+        <td data-lang="en">Run the universal installer (<b>user-setup.exe</b>) or launch <b>ArcadeClip.exe</b> from the portable folder. In-app updates are also supported.</td>
       </tr>
       <tr>
         <th scope="row" data-lang="ko">라이선스</th>
@@ -281,17 +281,17 @@ html[lang="ko"] [data-lang="en"], html[lang="en"] [data-lang="ko"] { display: no
   <p data-lang="ko">문제가 생기면 앱의 <b>Settings → 진단 → 문제 신고</b>를 누르거나 아래에서 알려 주세요.</p>
   <p data-lang="en">If something goes wrong, use <b>Settings → Diagnostics → Report a problem</b> in the app, or report it below.</p>
   <div class="actions">
-    <a href="https://github.com/151net/ArcadeClip/issues" data-lang="ko">문제 신고</a>
-    <a href="https://github.com/151net/ArcadeClip/issues" data-lang="en">Report a problem</a>
+    <a href="https://github.com/ParkoutV/ArcadeClip/issues" data-lang="ko">문제 신고</a>
+    <a href="https://github.com/ParkoutV/ArcadeClip/issues" data-lang="en">Report a problem</a>
   </div>
 </section>
 
 </main>
 
 <footer>
-  <small data-lang="ko">ArcadeClip · <a href="manual.html#ko/overview/1">사용 설명서</a> · <a href="https://github.com/151net/ArcadeClip">소스 코드</a><br>
+  <small data-lang="ko">ArcadeClip · <a href="manual.html#ko/overview/1">사용 설명서</a> · <a href="https://github.com/ParkoutV/ArcadeClip">소스 코드</a><br>
   곡 자켓 이미지는 <a href="https://maimai.sega.jp/">maimai 공식 사이트</a>의 자료이며, 권리는 SEGA와 각 권리자들에게 있습니다.</small>
-  <small data-lang="en">ArcadeClip · <a href="manual.html#en/overview/1">User guide</a> · <a href="https://github.com/151net/ArcadeClip">Source code</a><br>
+  <small data-lang="en">ArcadeClip · <a href="manual.html#en/overview/1">User guide</a> · <a href="https://github.com/ParkoutV/ArcadeClip">Source code</a><br>
   Song jacket images come from the <a href="https://maimai.sega.jp/">official maimai site</a>; SEGA and the respective owners hold the rights.</small>
 </footer>
 
