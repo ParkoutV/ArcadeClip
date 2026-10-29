@@ -170,7 +170,7 @@ class VideoCanvas(QWidget):
             self.overlay.setGeometry(self.rect())
             self.update()
         self.controls_hint.setFixedWidth(max(1, self.width()-28))
-        self.controls_hint.adjustSize()
+        hint_w = max(1, self.width()-28); self.controls_hint.setFixedSize(hint_w, self.controls_hint.fontMetrics().boundingRect(0, 0, max(1, hint_w-16), 10000, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.controls_hint.text()).height() + 16)
         self.controls_hint.move(14, max(0, self.height()-self.controls_hint.height()-12))
         super().resizeEvent(event)
 

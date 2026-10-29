@@ -80,9 +80,10 @@ def main():
             text, confidence = read(image)
             assert '12345' in text and confidence > .5, (text, confidence)
             ocr = {'text': text, 'confidence': confidence}
-            print('x64 OCR from ' + ARCH + ':', ocr, flush=True)
+            print('Native OCR on ' + ARCH + ':', ocr, flush=True)
         finally:
-            read.close()
+            if hasattr(read, 'close'):
+                read.close()
     versions['python'] = sys.version
     versions['qt_video_frames'] = len(frames)
     versions['ocr'] = ocr

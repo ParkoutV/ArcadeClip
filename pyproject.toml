@@ -9,7 +9,6 @@ dependencies = [
     "av==18.1.0",
     "Pillow==12.3.0",
     "yt-dlp[default]==2026.8.19",
-    "rapidocr==3.9.2",
     "onnxruntime==1.30.0",
     "numpy>=2.2,<3",
     "deno==2.9.6",

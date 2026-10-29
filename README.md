@@ -19,7 +19,7 @@ maimai 플레이를 길게 녹화한 영상에서 곡을 찾아, 곡별 MP4 파�
 
 처음 한 번만 하는 준비입니다.
 
-1. 통합 설치 파일(`user-setup.exe`)로 설치하거나 배포 폴더의 `ArcadeClip.exe`를 실행하세요. 폴더 안의 다른 파일도 함께 두세요.
+1. Windows 아키텍처에 맞는 AMD64 또는 ARM64 설치 파일(`user-setup.exe`)로 설치하거나 배포 폴더의 `ArcadeClip.exe`를 실행하세요. 폴더 안의 다른 파일도 함께 두세요.
 2. **폴더 선택**으로 데이터 폴더를 지정하세요. 곡 자켓 약 100 MB를 이 폴더에 받습니다.
 3. **시작하기 →**를 누르고 다운로드가 끝날 때까지 기다리세요. 약 10분이 걸릴 수 있습니다.
 
@@ -98,7 +98,7 @@ uv run start.py
 
 ## 만들기와 고치기
 
-- [Windows 빌드 안내 (AMD64 / ARM64)](docs/develop/WINDOWS.md) — 포터블 번들과 통합 설치 파일을 만듭니다.
+- [Windows 빌드 안내 (AMD64 / ARM64)](docs/develop/WINDOWS.md) — 포터블 번들과 아키텍처별 설치 파일을 만듭니다.
 - [Windows 배포본 만들기 (Nuitka)](docs/develop/BUILD.md) — 기존 Nuitka 배포 폴더를 만듭니다.
 - [설명서 고치고 게시하기](docs/develop/MANUAL.md) — 설명서 본문을 고치고 GitHub Pages에 올립니다.
 

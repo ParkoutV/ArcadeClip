@@ -11,7 +11,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tarfile
 import time
 import tomllib
 import urllib.request
@@ -31,11 +30,7 @@ PACKAGES = {p['name']: p for p in LOCK['package']}
 APP = ['av', 'certifi', 'charset-normalizer', 'idna', 'mutagen', 'numpy',
        'packaging', 'pillow', 'pycryptodomex', 'pyside6', 'pyside6-addons',
        'pyside6-essentials', 'requests', 'shiboken6', 'urllib3', 'websockets',
-       'yt-dlp', 'yt-dlp-ejs']
-OCR = ['av', 'certifi', 'charset-normalizer', 'colorama', 'colorlog', 'flatbuffers',
-       'idna', 'numpy', 'omegaconf', 'onnxruntime', 'opencv-python', 'packaging',
-       'pillow', 'protobuf', 'pyclipper', 'pyyaml', 'rapidocr', 'requests',
-       'shapely', 'six', 'tqdm', 'urllib3']
+       'yt-dlp', 'yt-dlp-ejs', 'onnxruntime', 'flatbuffers', 'protobuf']
 
 
 def write_readme():
@@ -43,7 +38,7 @@ def write_readme():
         f'ArcadeClip - Windows {ARCH.upper()}\n\n'
         'Run ArcadeClip.exe. Keep all files in this folder together.\n'
         'Python, dependencies, FFmpeg and Deno are included.\n'
-        'OCR runs in an isolated AMD64 Python runtime.\n'
+        'OCR runs natively using ONNX Runtime in the app Python.\n'
         'See BUILD-WINDOWS.md and build-manifest.json for build details.\n', encoding='utf-8')
     shutil.copy2(ROOT / 'docs/develop/WINDOWS.md', OUT / 'BUILD-WINDOWS.md')
 
@@ -84,7 +79,7 @@ def fetch(url, digest=None):
 def initialize_inputs():
     inputs = json.loads((ROOT / 'run/windows.inputs.lock.json').read_text())
     host = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'amd64'
-    return {**{key: inputs[key] for key in ('python-arm64', 'python-amd64')},
+    return {'python-' + ARCH: inputs['python-' + ARCH],
             'ffmpeg': inputs['ffmpeg-' + ARCH], 'deno': inputs['deno-' + ARCH],
             'zig': inputs['zig-' + host]}
 
@@ -160,11 +155,16 @@ def assemble():
     if OUT.exists():
         raise FileExistsError(f'Output already exists: {OUT}. Choose a fresh --output directory.')
     OUT.mkdir(parents=True)
-    for arch, folder in [(ARCH, 'runtime'), ('amd64', 'ocr-runtime')]:
+    for arch, folder in [(ARCH, 'runtime')]:
         runtime = OUT / folder
         unpack_zip(assets['python-' + arch], runtime)
         (runtime / 'python313._pth').write_text('python313.zip\n.\nLib/site-packages\n../src\nimport site\n')
     records['app-packages'] = install_packages(APP, ARCH, OUT / 'runtime/Lib/site-packages')
+    # Keep ONNX imports independent of a globally installed VC++ runtime, also
+    # when Setup uses an external Python. DLLs live beside ONNX's native module.
+    packages = OUT / 'runtime/Lib/site-packages'
+    for crt in (packages / 'shiboken6').glob('msvcp140*.dll'):
+        shutil.copy2(crt, packages / 'onnxruntime/capi' / crt.name)
     # Upstream archives include unused CRTs for other ABIs. None of the native
     # runtime's import tables references these; do not ship incompatible DLLs.
     records['omitted-unused-crt'] = []
@@ -175,38 +175,6 @@ def assemble():
         if extra.is_file() and machine(extra) != MACHINES[ARCH]:
             records['omitted-unused-crt'].append({'path': relative, 'sha256': hashlib.sha256(extra.read_bytes()).hexdigest()})
             extra.unlink()
-    records['ocr-packages'] = install_packages(OCR, 'amd64', OUT / 'ocr-runtime/Lib/site-packages')
-    # ONNX Runtime/Pyclipper import these names directly. Do not rely on the
-    # workstation's global VC++ Redistributable (NumPy only ships a renamed DLL).
-    crt_wheel = wheel_for('shiboken6', 'amd64')
-    crt_archive, crt_hash = fetch(crt_wheel['url'], crt_wheel['hash'].split(':')[1])
-    with zipfile.ZipFile(crt_archive) as archive:
-        for name in ('msvcp140.dll', 'msvcp140_1.dll'):
-            (OUT / 'ocr-runtime' / name).write_bytes(archive.read('shiboken6/' + name))
-        for name in archive.namelist():
-            if not name.endswith('/') and 'license' in name.lower():
-                dest = OUT / 'licenses/ocr-crt' / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(archive.read(name))
-    records['ocr-crt'] = {'url': crt_wheel['url'], 'sha256': crt_hash,
-                          'files': ['ocr-runtime/msvcp140.dll', 'ocr-runtime/msvcp140_1.dll']}
-    antlr = PACKAGES['antlr4-python3-runtime']['sdist']
-    path, digest = fetch(antlr['url'], antlr['hash'].split(':')[1])
-    with tarfile.open(path) as archive:
-        for item in archive.getmembers():
-            if '/src/antlr4/' in item.name and item.isfile():
-                relative = item.name.split('/src/', 1)[1]
-                dest = OUT / 'ocr-runtime/Lib/site-packages' / relative
-                if not dest.resolve().is_relative_to((OUT / 'ocr-runtime').resolve()):
-                    raise ValueError('Unsafe antlr member')
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(archive.extractfile(item).read())
-        info = OUT / 'ocr-runtime/Lib/site-packages/antlr4_python3_runtime-4.9.3.dist-info'
-        info.mkdir(exist_ok=True)
-        pkg_info = next(item for item in archive.getmembers() if item.name.count('/') == 1 and item.name.endswith('/PKG-INFO'))
-        (info / 'METADATA').write_bytes(archive.extractfile(pkg_info).read())
-        (info / 'RECORD').write_text('antlr4_python3_runtime-4.9.3.dist-info/METADATA,,\n')
-    records['antlr-source'] = {'url': antlr['url'], 'sha256': digest}
     ffdir = CACHE / ('ffmpeg-' + records['ffmpeg']['sha256'][:12])
     unpack_zip(assets['ffmpeg'], ffdir)
     ffroot = next(p.parent for p in ffdir.rglob('bin') if p.is_dir())
@@ -247,7 +215,7 @@ def assemble():
         shutil.copy2(ROOT / name, OUT / name)
     shutil.copy2(ROOT / 'run/license_sources/COPYING.GPLv3', OUT / 'COPYING.GPLv3')
     (OUT / 'ArcadeClip_dbg.cmd').write_text('@echo off\r\n"%~dp0ArcadeClip.exe" --debug %*\r\n', encoding='ascii')
-    (OUT / 'portable-runtime.json').write_text(json.dumps({'architecture': ARCH, 'ocr_python': 'ocr-runtime/python.exe'}, indent=2))
+    (OUT / 'portable-runtime.json').write_text(json.dumps({'architecture': ARCH, 'ocr_backend': 'native-onnx'}, indent=2))
     zigdir = CACHE / ('zig-' + records['zig']['sha256'][:12])
     unpack_zip(assets['zig'], zigdir)
     zig = next(zigdir.rglob('zig.exe'))
@@ -272,7 +240,7 @@ def assemble():
             continue
         architecture = machine(path)
         relative = path.relative_to(OUT).as_posix()
-        expected = 0x8664 if relative.startswith('ocr-runtime/') else MACHINES[ARCH]
+        expected = MACHINES[ARCH]
         if architecture != expected:
             raise ValueError(f'Unexpected architecture: {relative}: {architecture!r}')
         binaries.append({'path': relative, 'machine': hex(architecture),
@@ -280,7 +248,7 @@ def assemble():
     records['binaries'] = binaries
     records['architecture'] = ARCH
     records['version'] = tomllib.loads((ROOT / 'pyproject.toml').read_text())['project']['version']
-    records['notes'] = ['Native embedded Python app with an isolated AMD64 OCR runtime.',
+    records['notes'] = ['Native embedded Python app and ONNX OCR runtime.',
                         'Jacket data and OCR models download on first use.']
     (OUT / 'build-manifest.json').write_text(json.dumps(records, indent=2) + '\n')
     subprocess.run([str(OUT / 'runtime/python.exe'), '-X', 'utf8',

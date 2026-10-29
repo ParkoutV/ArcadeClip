@@ -196,7 +196,7 @@ class MainWindow(QMainWindow):
         self.stage_group.button(index).setChecked(True)
         self.list_stack.setCurrentIndex(1 if index >= 3 else 0)
         self.detail_stack.setCurrentIndex(index)
-        self.workspace_splitter.setSizes({0: [550, 650, 320], 1: [0, 1000, 0],
+        self.workspace_splitter.setSizes({0: [310, 410, 480], 1: [0, 1000, 0],
                                          2: [0, 850, 330], 3: [300, 700, 300],
                                          4: [0, 650, 520], 5: [0, 800, 360]}[index])
         self.source_context.setText(str(self.path) if self.path else

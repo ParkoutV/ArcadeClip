@@ -129,11 +129,11 @@ def latest_release_info(timeout=TIMEOUT, arch: str | None = None) -> dict | None
         is_amd = any(token in lower for token in ('amd64', 'x64', 'x86_64'))
         universal = 'universal' in lower or (is_arm and is_amd)
         if target_arch and universal:
-            ranked.append((0, name, url))
+            ranked.append((1, name, url))
         elif target_arch == 'arm64' and is_arm:
-            ranked.append((1, name, url))
+            ranked.append((0, name, url))
         elif target_arch == 'amd64' and is_amd:
-            ranked.append((1, name, url))
+            ranked.append((0, name, url))
     if ranked:
         _, chosen_name, chosen_url = min(ranked)
 

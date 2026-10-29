@@ -1,6 +1,7 @@
 """Architecture selection and optional external runtime regressions."""
 import configparser
 import io
+import json
 from pathlib import Path
 import struct
 import tempfile
@@ -11,6 +12,7 @@ import architecture
 import runtime_config
 import sources
 import updates
+import ocr_bridge
 
 
 class ArchitectureTests(unittest.TestCase):
@@ -26,17 +28,24 @@ class ArchitectureTests(unittest.TestCase):
                  patch('architecture.platform.machine', return_value='ARM64'):
                 self.assertEqual(architecture.process_architecture(), arch)
 
-    def test_universal_update_preferred_for_both_architectures(self):
-        names = ['ArcadeClip-windows-arm64-setup.exe', 'ArcadeClip-windows-x64-setup.exe',
+    def test_specific_update_preferred_for_both_architectures(self):
+        names = ['ArcadeClip-windows-arm64-setup.exe', 'ArcadeClip-windows-amd64-setup.exe',
                  'ArcadeClip-windows-universal-user-setup.exe']
         payload = {'tag_name': 'v0.2.3', 'assets': [
             {'name': n, 'browser_download_url': 'https://example.test/' + n}
-            for n in [*names, names[-1] + '.sha256']]}
+            for n in [*names, *(name + '.sha256' for name in names)]]}
         for arch in ('AMD64', 'x86_64', 'ARM64', 'aarch64'):
             with self.subTest(arch=arch), patch('updates._fetch_release_payload', return_value=payload):
                 result = updates.latest_release_info(arch=arch)
-                self.assertEqual(result['installer_name'], names[-1])
+                self.assertEqual(result['installer_name'], names[0] if arch in ('ARM64', 'aarch64') else names[1])
                 self.assertTrue(result['sha256_url'].endswith('.sha256'))
+
+    def test_legacy_universal_update_remains_a_fallback(self):
+        name = 'ArcadeClip-windows-universal-user-setup.exe'
+        with patch('updates._fetch_release_payload', return_value={
+                'tag_name': 'v1', 'assets': [{'name': name, 'browser_download_url': 'https://example.test/' + name}]}):
+            for arch in ('ARM64', 'AMD64'):
+                self.assertEqual(updates.latest_release_info(arch=arch)['installer_name'], name)
 
     def test_never_falls_back_to_wrong_architecture_or_unknown_exe(self):
         for arch, name in (('ARM64', 'ArcadeClip-windows-x64-setup.exe'),
@@ -49,6 +58,21 @@ class ArchitectureTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_native_ocr_does_not_require_a_worker_but_legacy_bundles_do(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / 'portable-runtime.json'
+            with patch.object(ocr_bridge, '__file__', str(root / 'src/ocr_bridge.py')):
+                manifest.write_text(json.dumps({'ocr_backend': 'native-onnx'}))
+                self.assertIsNone(ocr_bridge.bundled_worker())
+                manifest.write_text(json.dumps({'ocr_python': 'ocr-runtime/python.exe'}))
+                with self.assertRaisesRegex(RuntimeError, 'missing'):
+                    ocr_bridge.bundled_worker()
+                (root / 'ocr-runtime').mkdir()
+                python = root / 'ocr-runtime/python.exe'
+                python.touch()
+                self.assertEqual(ocr_bridge.bundled_worker(), python.resolve())
+
     def test_configured_ffmpeg_uses_unicode_path_and_does_not_affect_deno(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

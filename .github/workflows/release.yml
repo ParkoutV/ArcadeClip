@@ -91,14 +91,16 @@ jobs:
           if ((Get-FileHash $path -Algorithm SHA256).Hash -ne '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732') { throw 'Compiler checksum mismatch.' }
           $process = Start-Process $path -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$pwd/build/installer-tools/inno" -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw 'Compiler installation failed.' }
-      - name: Compile universal installer
+      - name: Compile separate AMD64 and ARM64 installers
         run: ./run/build_user_installer.ps1
       - uses: actions/upload-artifact@v7
         with:
-          name: ArcadeClip-windows-universal-installer
+          name: ArcadeClip-windows-installers
           path: |
-            dist/installers/*-windows-universal-user-setup.exe
-            dist/installers/*-windows-universal-user-setup.exe.sha256
+            dist/installers/*-windows-amd64-user-setup.exe
+            dist/installers/*-windows-arm64-user-setup.exe
+            dist/installers/*-windows-amd64-user-setup.exe.sha256
+            dist/installers/*-windows-arm64-user-setup.exe.sha256
           compression-level: 0
           retention-days: 14
       - name: Create draft release
@@ -108,15 +110,17 @@ jobs:
           draft: true
           fail_on_unmatched_files: true
           files: |
-            dist/installers/*-windows-universal-user-setup.exe
-            dist/installers/*-windows-universal-user-setup.exe.sha256
+            dist/installers/*-windows-amd64-user-setup.exe
+            dist/installers/*-windows-arm64-user-setup.exe
+            dist/installers/*-windows-amd64-user-setup.exe.sha256
+            dist/installers/*-windows-arm64-user-setup.exe.sha256
           body: |
-            AMD64/ARM64 통합 설치 파일입니다. Windows 아키텍처를 자동으로 인식합니다.
+            AMD64와 ARM64 설치 파일을 각각 제공합니다. Windows 아키텍처에 맞는 파일을 선택하세요.
             설치 중 Python 및 FFmpeg를 내장하거나 호환되는 PATH 설치를 선택할 수 있습니다.
             Windows 10/11 AMD64, Windows 11 ARM64를 지원합니다.
 
-            Universal installer with native architecture detection and independent local/bundled
-            Python and FFmpeg choices. The isolated x64 OCR runtime is always included.
+            Separate AMD64 and ARM64 installers with independent local/bundled Python and FFmpeg choices.
+            OCR runs natively on both architectures; ARM64 does not require AMD64 Python.
             Original application source: MIT. Combined binary distribution: GPLv3.
             See bundled LICENSE, DISTRIBUTION.md, COPYING.GPLv3 and SOURCE-INFO.md.
             Before publishing this draft, provide the complete Corresponding Source required

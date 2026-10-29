@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import threading
 from time import perf_counter
-import numpy as np
 from jackets import _atomic_write, _fetch, relaxed_context
 from media import frame_at
 from analysis_common import DEFAULTS, check_cancel, crop, progress
@@ -32,16 +31,13 @@ def same_player(value, other):
 
 
 def make_ocr(directory, cancel, report, *, _local=False):
-    """Use pinned RapidOCR recognition only: the user already supplies text-line ROIs."""
+    """Use native ONNX line recognition; retain IPC for older isolated OCR bundles."""
     if not _local:
         from ocr_bridge import bundled_worker, RemoteOCR
         worker = bundled_worker()
         if worker is not None:
             return RemoteOCR(worker, directory, cancel, report)
-    import rapidocr
-    from rapidocr import LangRec, ModelType, OCRVersion
-    from rapidocr.ch_ppocr_rec import TextRecInput, TextRecognizer
-    from rapidocr.utils.parse_parameters import ParseParams
+    from onnx_recognition import OnnxRecognizer
     # maimai names are Latin, digits and symbols, with kana on the Japanese servers, and the
     # Chinese model is the one whose dictionary covers all of them.
     language, checksum = "ch", "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5"
@@ -57,22 +53,13 @@ def make_ocr(directory, cancel, report, *, _local=False):
             raise ValueError(tr('OCR 모델 검증에 실패했습니다. 다시 시도해 주세요.'))
         model.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(model, body)
-    cfg = ParseParams.load(Path(rapidocr.__file__).parent / "config.yaml")
-    cfg.Rec.lang_type = LangRec(language)
-    cfg.Rec.model_type = ModelType.MOBILE
-    cfg.Rec.ocr_version = OCRVersion.PPOCRV5
-    cfg.Rec.model_path = str(model)
-    cfg.Rec.font_path = None
-    cfg.Rec.engine_cfg = cfg.EngineConfig.onnxruntime
-    cfg.Rec.engine_cfg.intra_op_num_threads = 2
-    cfg.Rec.engine_cfg.inter_op_num_threads = 1
     check_cancel(cancel)
-    engine = TextRecognizer(cfg.Rec)
+    engine = OnnxRecognizer(model)
     def read(image):
         check_cancel(cancel)
-        result = engine(TextRecInput(img=np.asarray(image.convert("RGB"))[:, :, ::-1].copy()))
+        result = engine(image)
         check_cancel(cancel)
-        return (result.txts[0], float(result.scores[0])) if result.txts else ("", 0.0)
+        return result
     return read
 
 

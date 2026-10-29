@@ -19,7 +19,10 @@ def bundled_worker():
         manifest = root / 'arm64-portable.json'  # Existing ARM64 installations.
     if not manifest.is_file():
         return None
-    path = (root / json.loads(manifest.read_text())['ocr_python']).resolve()
+    config = json.loads(manifest.read_text())
+    if config.get('ocr_backend') == 'native-onnx':
+        return None
+    path = (root / config['ocr_python']).resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise RuntimeError('Bundled OCR runtime is missing or invalid.')
     return path

@@ -20,7 +20,7 @@ sources = json.loads((licenses / 'sources.json').read_text(encoding='utf-8'))
 sources = {k: v.replace('/n9.0.1/', '/n8.1.3/') for k, v in sources.items()}
 (licenses / 'sources.json').write_text(json.dumps(sources, indent=2), encoding='utf-8')
 entries = []
-for role, runtime in [(manifest.get('architecture', 'arm64').upper(), 'runtime'), ('OCR-x64', 'ocr-runtime')]:
+for role, runtime in [(manifest.get('architecture', 'arm64').upper(), 'runtime')]:
     target = licenses / ('inventory-' + role + '.json')
     subprocess.run([str(bundle / runtime / 'python.exe'), '-X', 'utf8',
                     str(ROOT / 'run/inventory_runtime_licenses.py'), role, str(target)],
@@ -44,7 +44,6 @@ entries.extend(e for e in collect_licenses.collect_external(bundle / 'tools')
                if e['name'] != 'Python runtime')
 for name, paths in [
     ('ArcadeClip launcher and GPU ROI helper', [ROOT / 'LICENSE', *sorted((licenses / 'launcher').rglob('*'))]),
-    ('OCR Microsoft runtime notices', sorted((licenses / 'ocr-crt').rglob('*'))),
 ]:
     notices = [{'file': p.name, 'text': p.read_text(encoding='utf-8', errors='replace')}
                for p in paths if p.is_file()]
@@ -56,7 +55,7 @@ header = '''ArcadeClip Windows - 구성 요소 및 라이선스 안내 / License
 ArcadeClip 자체 코드, 런처 및 GPU 이미지 변환 보조 코드는 MIT License입니다.
 GPL 구성 요소를 포함하는 결합 배포물의 조건은 동봉된 DISTRIBUTION.md와
 아래 GPLv3 전문을 참고하세요. 외부 구성 요소의 저작권과 개별 라이선스는 유지됩니다.
-Python 3.13.12 (AMD64/ARM64 앱 및 OCR x64), PySide6/Qt, PyAV, FFmpeg 8.1.3,
+Python 3.13.12 (AMD64/ARM64 앱 및 네이티브 OCR), PySide6/Qt, PyAV, FFmpeg 8.1.3,
 Deno, OCR 및 기타 내장 패키지의 버전별 원문은 src/licenses.json과 licenses 폴더에
 있으며 프로그램의 오픈소스 라이선스 보기에서도 확인할 수 있습니다.
 이 고지는 외부 구성 요소의 수정·재배포 권리를 제한하지 않습니다.
